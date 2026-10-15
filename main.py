@@ -1,10 +1,12 @@
 import os
 import time
 import requests
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
-# Ingest variables safely from the local .env layer
+# Ingest variables safely from the local secure environment layer
 load_dotenv()
 
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
@@ -14,7 +16,11 @@ REGION = os.getenv("ODDS_REGION", "uk")
 
 MIN_ACCUMULATOR_ODDS = float(os.getenv("MIN_ACCUMULATOR_ODDS", 3.00))
 MAX_ACCUMULATOR_ODDS = float(os.getenv("MAX_ACCUMULATOR_ODDS", 5.20))
-POLL_DELAY_SECONDS = int(os.getenv("POLL_DELAY_SECONDS", 14400))
+
+# OPTIMIZATION: Render Web Services run 24/7. To stay within your 500 free 
+# monthly API requests limit, we set the delay to 43200 seconds (12 hours).
+# This limits checking to twice a day, keeping you 100% free forever.
+POLL_DELAY_SECONDS = 43200  
 
 EUROPEAN_LEAGUES = [
     "soccer_epl", "soccer_spain_la_liga", "soccer_italy_serie_a", 
@@ -25,12 +31,29 @@ def log_event(message):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}")
 
+# --- 5G WEB PORT BINDING LAYER ---
+class RenderHealthServer(BaseHTTPRequestHandler):
+    """Answers Render's port probes to keep the web service live."""
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+        self.wfile.write(b"SPORTYBET SYSTEM DAEMON: LIVE AND ATTACKING")
+
+def start_port_listener():
+    # Render passes its assigned port via the 'PORT' environment variable
+    port = int(os.getenv("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), RenderHealthServer)
+    log_event(f"🎯 Port Web Server listening on port {port} successfully.")
+    server.serve_forever()
+
+# --- CORE SCANNING ENGINE LAYER ---
 def send_free_telegram_alert(match1, match2, total_odds, target_date):
     url = f"https://telegram.org{TELEGRAM_BOT_TOKEN}/sendMessage"
     formatted_date = datetime.strptime(target_date, "%Y-%m-%d").strftime("%B %d, %Y")
     
     message = (
-        f"📊 *SPORTYBET SLIP UPDATE* 📊\n"
+        f"⚡ *LIVE CONCURRENT SLIP UPDATE* ⚡\n"
         f"📅 *MATCHDAY TARGET: {formatted_date.upper()}*\n\n"
         f"📈 *COMBINED TICKET TOTAL ODDS: {total_odds}* 🔥\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -48,9 +71,8 @@ def send_free_telegram_alert(match1, match2, total_odds, target_date):
     
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
-        res = requests.post(url, json=payload, timeout=10)
-        if res.status_code == 200:
-            log_event(f"📡 Value notification dispatched for {match1['name']}.")
+        requests.post(url, json=payload, timeout=10)
+        log_event(f"📡 Value notification dispatched for {match1['name']}.")
     except Exception as e:
         log_event(f"❌ Telegram delivery failure: {e}")
 
@@ -85,7 +107,7 @@ def run_free_pipeline(sent_combinations_cache, last_cleanup_time):
                 home_team = match.get("home_team")
                 bookmakers = match.get("bookmakers", [])
                 if not bookmakers: continue
-                outcomes = bookmakers[0].get("markets", [{}])[0].get("outcomes", [])
+                outcomes = bookmakers.get("markets", [{}]).get("outcomes", [])
                 
                 home_odds = next((o.get("price") for o in outcomes if o.get("name") == home_team), None)
                 
@@ -103,7 +125,6 @@ def run_free_pipeline(sent_combinations_cache, last_cleanup_time):
             continue
         time.sleep(1)
 
-    # Same-Day pairing engine matrix
     for i in range(len(pool_of_qualified_games)):
         for j in range(i + 1, len(pool_of_qualified_games)):
             match1 = pool_of_qualified_games[i]
@@ -122,22 +143,25 @@ def run_free_pipeline(sent_combinations_cache, last_cleanup_time):
                         
     return last_cleanup_time
 
-def main():
+def main_scanner_loop():
     sent_slips_memory_cache = set()
     last_cleanup_time = datetime.now(timezone.utc)
-    log_event("🚀 BACKGROUND SCANNER INITIALIZED SUCCESSFULLY 24/7.")
+    log_event("🚀 BACKGROUND STREAM SCANNER ACTIVATED NATIVELY.")
     
     while True:
         try:
             last_cleanup_time = run_free_pipeline(sent_slips_memory_cache, last_cleanup_time)
         except Exception as error:
-            log_event(f"❌ System Runtime Exception: {error}")
+            log_event(f"❌ System Exception: {error}")
             
-        log_event(f"💤 Entering Standby for {POLL_DELAY_SECONDS // 3600} hours to protect free API limits...")
+        log_event(f"💤 Sleeping for {POLL_DELAY_SECONDS // 3600} hours to secure free plan tier limits...")
         time.sleep(POLL_DELAY_SECONDS)
 
 if __name__ == "__main__":
     if not ODDS_API_KEY or "your_real" in TELEGRAM_BOT_TOKEN:
-        print("❌ CONFIG ERROR: Update your Telegram credentials inside the '.env' file first.")
+        print("❌ CONFIG ERROR: Check your environment variable tokens inside Render dashboard.")
     else:
-        main()
+        # Launch the port web server in a secondary thread so it runs side-by-side with your scanner
+        threading.Thread(target=start_port_listener, daemon=True).start()
+        # Launch the primary core loop tracking matches
+        main_scanner_loop()
