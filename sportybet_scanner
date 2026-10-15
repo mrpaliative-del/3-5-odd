@@ -1,0 +1,5 @@
+sportybet_scanner/
+│
+├── .env                  # Environment configuration file (Hidden secrets)
+├── requirements.txt      # Project system dependency framework
+└── main.py               # The core 4G/5G live streaming script daemon
