@@ -1,0 +1,39 @@
+name: 5G Live Accumulator Scanner
+
+on:
+  schedule:
+    # Triggers the cloud container automatically every 4 hours
+    - cron: '0 */4 * * *'
+  workflow_dispatch: # Allows you to tap a button on GitHub to force a manual scan
+
+jobs:
+  scan_markets:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Clone Code Repository
+      uses: actions/checkout@v3
+
+    - name: Initialize Python Environment
+      uses: actions/setup-python@v4
+      with:
+        python-python-version: '3.10'
+
+    - name: Bind Project Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Execute Live Streaming Pipeline
+      env:
+        # Securely links variables mapped from your GitHub Repository Secrets panel
+        ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        ODDS_REGION: 'uk'
+        MIN_ACCUMULATOR_ODDS: '3.00'
+        MAX_ACCUMULATOR_ODDS: '5.20'
+      run: |
+        # Adjusting the delay parameter to 0 ensures immediate single-pass execution in cloud modes
+        export POLL_DELAY_SECONDS=0
+        python main.py
