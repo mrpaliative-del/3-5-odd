@@ -1,24 +1,20 @@
+
 import os
 import time
 import html
-import threading
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import httpx
-from fastapi import FastAPI
-import uvicorn
-
 import requests
 from dotenv import load_dotenv
-from thefuzz import fuzz
 
 load_dotenv()
 
 # ============================================================
-# SOLVEASE FOOTBALL SCANNER — REAL ODDS + MULTI-BOOKMAKER ARBITRAGE
-# Analysis and alerts only. No automatic betting.
+# SOLVEEASE 5G LIVE ACCUMULATOR SCANNER
+# Live odds analysis + Telegram alerts. No automatic betting.
 # ============================================================
 
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
@@ -26,12 +22,19 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 REGION = os.getenv("ODDS_REGION", "uk").strip()
-POLL_DELAY_SECONDS = max(3600, int(os.getenv("POLL_DELAY_SECONDS", "43200")))
+POLL_DELAY_SECONDS = max(
+    3600, int(os.getenv("POLL_DELAY_SECONDS", "14400"))
+)
 LOOKAHEAD_HOURS = max(1, int(os.getenv("LOOKAHEAD_HOURS", "48")))
 
-TOTAL_BANKROLL = float(os.getenv("TOTAL_BANKROLL", "100000.0"))  # Default: ₦100,000 NGN
-ROUND_NEAREST = int(os.getenv("ROUND_NEAREST", "500"))          # Default: Anti-ban ₦500 blocks
-SIMILARITY_THRESHOLD = 85                                       # Minimum fuzzy match score
+MIN_ACCUMULATOR_ODDS = float(
+    os.getenv("MIN_ACCUMULATOR_ODDS", "3.00")
+)
+MAX_ACCUMULATOR_ODDS = float(
+    os.getenv("MAX_ACCUMULATOR_ODDS", "5.20")
+)
+MIN_HOME_ODDS = float(os.getenv("MIN_HOME_ODDS", "1.15"))
+MAX_HOME_ODDS = float(os.getenv("MAX_HOME_ODDS", "3.50"))
 
 API_BASE_URL = "https://api.the-odds-api.com/v4"
 TELEGRAM_BASE_URL = "https://api.telegram.org"
@@ -49,33 +52,29 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s UTC | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("solveease-football")
-
-app = FastAPI(title="Multi-Bookmaker Arbitrage Engine with Deep Links")
-
-# ============================================================
-# HTTP SESSIONS
-# ============================================================
+log = logging.getLogger("solveease-scanner")
 
 session = requests.Session()
-session.headers.update({"User-Agent": "SolveEase-FootballScanner/1.0"})
+session.headers.update({"User-Agent": "SolveEaseScanner/1.0"})
 
 cache_lock = threading.Lock()
-sent_combinations_cache = set()
-last_cleanup_time = datetime.now(timezone.utc)
+sent_combinations = set()
+last_cache_cleanup = datetime.now(timezone.utc)
+
+# Stops concurrent manual/background scans from running together.
+scan_lock = threading.Lock()
+quota_exhausted = threading.Event()
 
 
 # ============================================================
-# TELEGRAM DELIVERY
+# TELEGRAM
 # ============================================================
 
 def send_telegram_message(message):
-    """Return True only when Telegram confirms message delivery."""
-
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.error(
-            "Telegram not configured. Set TELEGRAM_BOT_TOKEN "
-            "and TELEGRAM_CHAT_ID."
+            "Telegram configuration missing: set "
+            "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID."
         )
         return False
 
@@ -84,76 +83,74 @@ def send_telegram_message(message):
         f"{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
 
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-
     try:
-        response = session.post(url, json=payload, timeout=15)
+        response = session.post(
+            url,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=15,
+        )
 
         try:
-            result = response.json()
+            data = response.json()
         except ValueError:
-            result = {}
+            data = {}
 
         if (
             response.ok
-            and result.get("ok") is True
-            and result.get("result", {}).get("message_id")
+            and data.get("ok") is True
+            and data.get("result", {}).get("message_id")
         ):
             log.info(
                 "Telegram delivery confirmed. Message ID: %s",
-                result["result"]["message_id"],
+                data["result"]["message_id"],
             )
             return True
 
         log.error(
-            "Telegram rejected message. HTTP %s: %s",
+            "Telegram delivery rejected: HTTP %s — %s",
             response.status_code,
-            result.get("description", response.text[:300]),
+            data.get("description", response.text[:300]),
         )
         return False
 
-    except requests.RequestException:
-        log.exception("Telegram network request failed.")
+    except requests.RequestException as exc:
+        log.error("Telegram request failed: %s", exc)
         return False
 
 
 def send_startup_test():
-    message = (
-        "🟢 <b>SolveEase Multi-Bookmaker Arbitrage Scanner</b>\n\n"
-        "Telegram connection test successful.\n"
+    return send_telegram_message(
+        "🟢 <b>SolveEase 5G Scanner is online</b>\n\n"
+        "Telegram delivery test successful.\n"
         "Mode: analysis and alerts only.\n"
-        "Live odds and multi-bookmaker arbs (SportyBet, Bet9ja, 1xBet, Betway) are checked.\n\n"
-        "⚠️ No profit or winning result is guaranteed."
+        "No winning outcome or profit is guaranteed."
     )
-    return send_telegram_message(message)
-
-
-def get_bookmaker_deep_link(bookmaker, match_name):
-    """Generates direct search/lobby deep links for each bookmaker."""
-    query = match_name.replace(" vs ", " ").replace(" v ", " ").replace(" ", "+")
-    if bookmaker == "SportyBet":
-        return f"https://www.sportybet.com/ng/sport/football?q={query}"
-    elif bookmaker == "Bet9ja":
-        return f"https://sports.bet9ja.com/desktop/home"
-    elif bookmaker == "1xBet":
-        return f"https://1xbet.ng/en/search/{query}"
-    elif bookmaker == "Betway":
-        return f"https://www.betway.com.ng/sports/search?searchTerm={query}"
-    return "https://www.google.com"
 
 
 # ============================================================
-# ODDS API & MULTI-BOOKMAKER FETCHERS
+# ODDS API
 # ============================================================
 
 def fetch_league_odds(sport_key):
-    """Fetch upcoming 1X2 events for one league."""
+    """
+    Return a list of events on success.
+    Return None on API/quota failure so the caller stops scanning.
+    """
+
+    if quota_exhausted.is_set():
+        return None
+
+    if not ODDS_API_KEY:
+        log.error("ODDS_API_KEY is missing.")
+        return None
+
     url = f"{API_BASE_URL}/sports/{sport_key}/odds/"
+
     params = {
         "apiKey": ODDS_API_KEY,
         "regions": REGION,
@@ -164,295 +161,413 @@ def fetch_league_odds(sport_key):
 
     try:
         response = session.get(url, params=params, timeout=20)
-        remaining = response.headers.get("x-requests-remaining")
-        used = response.headers.get("x-requests-used")
+    except requests.RequestException as exc:
+        log.error("Odds API network error for %s: %s", sport_key, exc)
+        return None
 
-        if remaining is not None or used is not None:
-            log.info("Odds API quota: used=%s remaining=%s", used, remaining)
+    remaining_header = response.headers.get("x-requests-remaining")
+    used_header = response.headers.get("x-requests-used")
 
-        if response.status_code == 401:
-            log.error("Odds API rejected the key. Check ODDS_API_KEY.")
-            return []
-        if response.status_code == 429:
-            log.error("Odds API rate/quota limit reached.")
-            return []
-        if response.status_code != 200:
-            log.error("Odds API error for %s: HTTP %s", sport_key, response.status_code)
-            return []
+    try:
+        remaining = (
+            int(remaining_header)
+            if remaining_header is not None
+            else None
+        )
+    except (ValueError, TypeError):
+        remaining = None
 
+    log.info(
+        "Odds API quota: used=%s remaining=%s",
+        used_header or "unknown",
+        remaining if remaining is not None else "unknown",
+    )
+
+    if remaining == 0 or response.status_code == 429:
+        quota_exhausted.set()
+        log.error(
+            "Odds API quota/rate limit reached. "
+            "Stopping requests for this scan."
+        )
+        return None
+
+    if response.status_code in (401, 403):
+        log.error(
+            "Odds API rejected the request (HTTP %s). "
+            "Check key validity, account status and quota. Response: %s",
+            response.status_code,
+            response.text[:300],
+        )
+        return None
+
+    if response.status_code != 200:
+        log.error(
+            "Odds API error for %s: HTTP %s — %s",
+            sport_key,
+            response.status_code,
+            response.text[:300],
+        )
+        return None
+
+    try:
         data = response.json()
-        if not isinstance(data, list):
-            return []
-        return data
-    except (requests.RequestException, ValueError):
-        log.exception("Failed to retrieve odds for %s.", sport_key)
-        return []
+    except ValueError:
+        log.error("Odds API returned invalid JSON for %s.", sport_key)
+        return None
+
+    if not isinstance(data, list):
+        log.error("Unexpected Odds API response for %s.", sport_key)
+        return None
+
+    return data
 
 
-async def fetch_sportybet_feed(client: httpx.AsyncClient):
-    url = "https://www.sportybet.com.ng/api/kes/factsCentre/pc/getUpcomingEvents?sport=football&today_only=true"
+# ============================================================
+# EVENT PARSING
+# ============================================================
+
+def parse_event(event, sport_key, now_utc, cutoff_utc):
+    commence_time = event.get("commence_time")
+    home_team = event.get("home_team")
+    away_team = event.get("away_team")
+    event_id = event.get("id")
+
+    if not all((commence_time, home_team, away_team, event_id)):
+        return None
+
     try:
-        response = await client.get(url, timeout=10.0)
-        if response.status_code == 200:
-            data = response.json()
-            formatted = []
-            for t in data.get("data", {}).get("tournaments", []):
-                for event in t.get("events", []):
-                    home, away = event.get("homeTeamName"), event.get("awayTeamName")
-                    if home and away:
-                        formatted.append({
-                            "bookmaker": "SportyBet",
-                            "match": f"{home} vs {away}",
-                            "home_team": home,
-                            "away_team": away,
-                            "odds": {"Home": 2.15, "Draw": 3.30, "Away": 3.10}
-                        })
-            return formatted
-    except Exception:
-        pass
-    return []
+        kickoff = datetime.fromisoformat(
+            commence_time.replace("Z", "+00:00")
+        )
+        if kickoff.tzinfo is None:
+            kickoff = kickoff.replace(tzinfo=timezone.utc)
+        kickoff = kickoff.astimezone(timezone.utc)
+    except (ValueError, TypeError, AttributeError):
+        log.warning("Skipping event with invalid kickoff time.")
+        return None
 
+    if kickoff <= now_utc or kickoff > cutoff_utc:
+        return None
 
-async def fetch_bet9ja_feed(client: httpx.AsyncClient):
-    url = "https://sports.bet9ja.com/desktop/feapi/mobile/getprematchevents"
-    try:
-        response = await client.get(url, timeout=10.0)
-        if response.status_code == 200:
-            data = response.json()
-            formatted = []
-            for ev in data.get("G", []):
-                home, away = ev.get("H"), ev.get("A")
-                if home and away:
-                    formatted.append({
-                        "bookmaker": "Bet9ja",
-                        "match": f"{home} vs {away}",
-                        "home_team": home,
-                        "away_team": away,
-                        "odds": {"Home": 2.10, "Draw": 3.50, "Away": 3.25}
-                    })
-            return formatted
-    except Exception:
-        pass
-    return []
+    bookmakers = event.get("bookmakers", [])
+    if not isinstance(bookmakers, list):
+        return None
 
+    best_price = None
+    best_bookmaker = None
 
-async def fetch_1xbet_feed(client: httpx.AsyncClient):
-    return [{
-        "bookmaker": "1xBet",
-        "match": "Remo Stars vs Enyimba",
-        "home_team": "Remo Stars",
-        "away_team": "Enyimba",
-        "odds": {"Home": 2.30, "Draw": 3.40, "Away": 3.10}
-    }]
+    for bookmaker in bookmakers:
+        markets = bookmaker.get("markets", [])
+        if not isinstance(markets, list):
+            continue
 
-
-async def fetch_betway_feed(client: httpx.AsyncClient):
-    return [{
-        "bookmaker": "Betway",
-        "match": "Remo Stars vs Enyimba",
-        "home_team": "Remo Stars",
-        "away_team": "Enyimba",
-        "odds": {"Home": 2.20, "Draw": 3.60, "Away": 3.30}
-    }]
-
-
-def round_to_nearest(val, base=500):
-    return int(base * round(val / base))
-
-
-def match_and_evaluate_all(all_fixtures, bankroll):
-    opportunities = []
-    for i in range(len(all_fixtures)):
-        for j in range(i + 1, len(all_fixtures)):
-            fix1, fix2 = all_fixtures[i], all_fixtures[j]
-            if fix1["bookmaker"] == fix2["bookmaker"]:
+        for market in markets:
+            if market.get("key") != "h2h":
                 continue
-                
-            home_score = fuzz.token_sort_ratio(fix1["home_team"], fix2["home_team"])
-            away_score = fuzz.token_sort_ratio(fix1["away_team"], fix2["away_team"])
-            
-            if home_score >= SIMILARITY_THRESHOLD and away_score >= SIMILARITY_THRESHOLD:
-                odds1, odds2 = fix1["odds"], fix2["odds"]
-                best_outcomes = []
-                for key in ["Home", "Draw", "Away"]:
-                    v1, v2 = odds1.get(key, 0), odds2.get(key, 0)
-                    if v1 > 0 and v2 > 0:
-                        if v1 >= v2:
-                            best_outcomes.append({"bookmaker": fix1["bookmaker"], "selection": key, "odds": v1})
-                        else:
-                            best_outcomes.append({"bookmaker": fix2["bookmaker"], "selection": key, "odds": v2})
 
-                if len(best_outcomes) == 3:
-                    implied_sum = sum(1.0 / item["odds"] for item in best_outcomes)
-                    if implied_sum < 1.0:
-                        margin = ((1.0 / implied_sum) - 1.0) * 100
-                        raw_stakes, total_staked = [], 0
-                        
-                        for item in best_outcomes:
-                            raw_stake = bankroll / (item["odds"] * implied_sum)
-                            rounded = round_to_nearest(raw_stake, ROUND_NEAREST)
-                            total_staked += rounded
-                            link = get_bookmaker_deep_link(item["bookmaker"], fix1["match"])
-                            raw_stakes.append({
-                                "bookmaker": item["bookmaker"],
-                                "selection": item["selection"],
-                                "odds": item["odds"],
-                                "stake": rounded,
-                                "return": round(rounded * item["odds"], 2),
-                                "link": link
-                            })
-                        
-                        min_return = min(s["return"] for s in raw_stakes)
-                        net_profit = min_return - total_staked
-                        
-                        opportunities.append({
-                            "match": fix1["match"],
-                            "bookmakers_involved": f"{fix1['bookmaker']} & {fix2['bookmaker']}",
-                            "margin": round(margin, 2),
-                            "total_staked": total_staked,
-                            "net_profit": round(net_profit, 2),
-                            "allocations": raw_stakes
-                        })
-    return opportunities
+            for outcome in market.get("outcomes", []):
+                if outcome.get("name") != home_team:
+                    continue
+
+                try:
+                    price = float(outcome.get("price"))
+                except (TypeError, ValueError):
+                    continue
+
+                if price <= 1.0:
+                    continue
+
+                if best_price is None or price > best_price:
+                    best_price = price
+                    best_bookmaker = bookmaker.get(
+                        "title",
+                        bookmaker.get("key", "Unknown"),
+                    )
+
+    if best_price is None or best_bookmaker is None:
+        return None
+
+    if not MIN_HOME_ODDS <= best_price <= MAX_HOME_ODDS:
+        return None
+
+    return {
+        "id": str(event_id),
+        "name": f"{home_team} vs {away_team}",
+        "league": sport_key.removeprefix("soccer_").replace("_", " "),
+        "home_odds": best_price,
+        "bookmaker": best_bookmaker,
+        "kickoff": kickoff,
+        "kickoff_date": kickoff.strftime("%Y-%m-%d"),
+    }
 
 
 # ============================================================
-# PIPELINE EXECUTION
+# ALERT FORMAT
 # ============================================================
 
-def clean_old_cache(now_utc):
-    global last_cleanup_time
+def format_alert(match1, match2, combined_odds):
+    date_text = datetime.strptime(
+        match1["kickoff_date"], "%Y-%m-%d"
+    ).strftime("%B %d, %Y")
+
+    return (
+        "⚽ <b>SOLVEEASE — TWO-MATCH CANDIDATE</b>\n\n"
+        f"📅 <b>UTC match date:</b> {html.escape(date_text)}\n"
+        f"📊 <b>Combined decimal odds:</b> {combined_odds:.2f}\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"1️⃣ <b>{html.escape(match1['name'])}</b>\n"
+        f"🏆 {html.escape(match1['league'])}\n"
+        "Selection: Home win (1X2)\n"
+        f"Odds: {match1['home_odds']:.2f}\n"
+        f"Bookmaker: {html.escape(match1['bookmaker'])}\n\n"
+        f"2️⃣ <b>{html.escape(match2['name'])}</b>\n"
+        f"🏆 {html.escape(match2['league'])}\n"
+        "Selection: Home win (1X2)\n"
+        f"Odds: {match2['home_odds']:.2f}\n"
+        f"Bookmaker: {html.escape(match2['bookmaker'])}\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "ℹ️ Prices are from The Odds API and may not be available "
+        "at SportyBet. Confirm current odds and markets independently.\n"
+        "⚠️ Candidate only. No outcome or profit is guaranteed."
+    )
+
+
+# ============================================================
+# SCAN ENGINE
+# ============================================================
+
+def clean_cache(now_utc):
+    global last_cache_cleanup
+
     with cache_lock:
-        if now_utc - last_cleanup_time >= timedelta(hours=24):
-            sent_combinations_cache.clear()
-            last_cleanup_time = now_utc
+        if now_utc - last_cache_cleanup >= timedelta(hours=24):
+            sent_combinations.clear()
+            last_cache_cleanup = now_utc
             log.info("Daily duplicate-alert cache cleared.")
 
 
 def run_free_pipeline():
-    now_utc = datetime.now(timezone.utc)
-    clean_old_cache(now_utc)
-    
-    log.info("Starting scan of multi-bookmaker feeds.")
+    if not scan_lock.acquire(blocking=False):
+        log.warning("A scan is already running; skipping this request.")
+        return
 
-    # Run async fetchers synchronously for the pipeline
-    loop = None
     try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        # Reset the per-scan quota flag.
+        quota_exhausted.clear()
 
-    async def fetch_all():
-        async with httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0"}) as client:
-            return await asyncio.gather(
-                fetch_sportybet_feed(client),
-                fetch_bet9ja_feed(client),
-                fetch_1xbet_feed(client),
-                fetch_betway_feed(client),
-                return_exceptions=True
-            )
+        now_utc = datetime.now(timezone.utc)
+        cutoff_utc = now_utc + timedelta(hours=LOOKAHEAD_HOURS)
+        clean_cache(now_utc)
 
-    results = loop.run_until_complete(fetch_all())
-    all_fixtures = []
-    for r in results:
-        if isinstance(r, list):
-            all_fixtures.extend(r)
+        candidates = []
+        log.info("Starting scan of %d leagues.", len(EUROPEAN_LEAGUES))
 
-    # Fallback mock data if live endpoints need active session cookies
-    if len(all_fixtures) < 2:
-        all_fixtures = [
-            {"bookmaker": "SportyBet", "match": "Remo Stars vs Enyimba", "home_team": "Remo Stars", "away_team": "Enyimba", "odds": {"Home": 2.45, "Draw": 3.30, "Away": 2.90}},
-            {"bookmaker": "1xBet", "match": "Remo Stars vs Enyimba", "home_team": "Remo Stars", "away_team": "Enyimba", "odds": {"Home": 2.10, "Draw": 3.50, "Away": 3.60}},
-        ]
+        for league in EUROPEAN_LEAGUES:
+            events = fetch_league_odds(league)
 
-    arbs = match_and_evaluate_all(all_fixtures, TOTAL_BANKROLL)
-    alerts_sent = 0
+            if events is None:
+                log.warning(
+                    "Scan stopped at %s because an API request failed "
+                    "or the quota was exhausted.",
+                    league,
+                )
+                break
 
-    for arb in arbs:
-        signature = f"{arb['match']}|{arb['bookmakers_involved']}"
-        with cache_lock:
-            already_sent = signature in sent_combinations_cache
+            for event in events:
+                candidate = parse_event(
+                    event, league, now_utc, cutoff_utc
+                )
+                if candidate:
+                    candidates.append(candidate)
 
-        if already_sent:
-            continue
-
-        msg = (
-            f"🚨 <b>MULTI-BOOKMAKER SUREBET!</b> 🚨\n\n"
-            f"⚽ <b>Fixture:</b> {html.escape(arb['match'])}\n"
-            f"📈 <b>Profit Margin:</b> {arb['margin']}%\n"
-            f"💸 <b>Total Deployed:</b> ₦{arb['total_staked']:,.2f}\n"
-            f"💰 <b>Guaranteed Profit:</b> ₦{arb['net_profit']:,.2f}\n\n"
-            f"📋 <b>Execution Plan (Click to Open):</b>\n"
-        )
-        for a in arb["allocations"]:
-            msg += f"• <a href='{a['link']}'><b>[{html.escape(a['bookmaker'])}]</b></a> Bet <b>{a['selection']}</b> @{a['odds']} ➔ <b>₦{a['stake']:,.2f}</b>\n"
-
-        if send_telegram_message(msg):
-            with cache_lock:
-                sent_combinations_cache.add(signature)
-            alerts_sent += 1
             time.sleep(1)
 
-    log.info("Scan complete. Arbs found=%d alerts_sent=%d", len(arbs), alerts_sent)
+        # Deduplicate events returned by the provider.
+        unique = {item["id"]: item for item in candidates}
+        candidates = sorted(
+            unique.values(),
+            key=lambda item: item["kickoff"],
+        )
+
+        log.info(
+            "Found %d qualifying individual matches.",
+            len(candidates),
+        )
+
+        combinations_found = 0
+        alerts_sent = 0
+
+        for i in range(len(candidates)):
+            for j in range(i + 1, len(candidates)):
+                match1 = candidates[i]
+                match2 = candidates[j]
+
+                if match1["kickoff_date"] != match2["kickoff_date"]:
+                    continue
+
+                combined_odds = round(
+                    match1["home_odds"] * match2["home_odds"], 2
+                )
+
+                if not (
+                    MIN_ACCUMULATOR_ODDS
+                    <= combined_odds
+                    <= MAX_ACCUMULATOR_ODDS
+                ):
+                    continue
+
+                combinations_found += 1
+                signature = "|".join(
+                    sorted([match1["id"], match2["id"]])
+                )
+
+                with cache_lock:
+                    if signature in sent_combinations:
+                        continue
+
+                if send_telegram_message(
+                    format_alert(match1, match2, combined_odds)
+                ):
+                    with cache_lock:
+                        sent_combinations.add(signature)
+                    alerts_sent += 1
+                    time.sleep(1)
+
+        log.info(
+            "Scan complete. Candidates=%d combinations=%d alerts_sent=%d",
+            len(candidates),
+            combinations_found,
+            alerts_sent,
+        )
+
+    finally:
+        scan_lock.release()
 
 
 # ============================================================
-# RENDER HEALTH SERVER & FASTAPI
+# RENDER HEALTH SERVER
 # ============================================================
 
-@app.get("/")
-def health_check():
-    return {
-        "status": "online",
-        "service": "Arbitrage Engine with Deep Links",
-        "bankroll": f"₦{TOTAL_BANKROLL:,.2f}"
-    }
+class RenderHealthServer(BaseHTTPRequestHandler):
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path in ("/", "/health"):
+            body = (
+                "SolveEase 5G Scanner is running.\n"
+                "Mode: analysis and Telegram alerts only.\n"
+            ).encode("utf-8")
+            status = 200
+
+        elif self.path == "/test-telegram":
+            ok = send_telegram_message(
+                "✅ <b>Telegram test successful</b>\n"
+                "Your scanner can send Telegram messages."
+            )
+            body = (
+                b"Telegram test succeeded.\n"
+                if ok
+                else b"Telegram test failed. Check Render logs.\n"
+            )
+            status = 200 if ok else 502
+
+        elif self.path == "/scan-now":
+            threading.Thread(
+                target=run_free_pipeline,
+                daemon=True,
+            ).start()
+            body = b"Scan requested. Check Render logs.\n"
+            status = 202
+
+        else:
+            body = b"Not found.\n"
+            status = 404
+
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        log.info("Health server: " + fmt, *args)
 
 
-async def continuous_scanner():
-    await asyncio.sleep(5.0)
-    while True:
-        try:
-            run_free_pipeline()
-        except Exception as e:
-            log.exception("Scanner loop exception: %s", e)
-        
-        log.info("Scan complete. Sleeping for 15 minutes...")
-        await asyncio.sleep(900)
-
-
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(continuous_scanner())
+def start_port_listener():
+    port = int(os.getenv("PORT", "10000"))
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", port),
+        RenderHealthServer,
+    )
+    log.info("Health server listening on port %s.", port)
+    server.serve_forever()
 
 
 # ============================================================
-# CONFIGURATION & ENTRY POINT
+# STARTUP
 # ============================================================
 
 def validate_config():
     errors = []
+
+    if not ODDS_API_KEY:
+        errors.append("ODDS_API_KEY is missing.")
     if not TELEGRAM_BOT_TOKEN:
         errors.append("TELEGRAM_BOT_TOKEN is missing.")
     if not TELEGRAM_CHAT_ID:
         errors.append("TELEGRAM_CHAT_ID is missing.")
-    if errors:
-        for error in errors:
-            log.error("CONFIGURATION: %s", error)
-        return False
-    return True
+    if MIN_ACCUMULATOR_ODDS <= 1:
+        errors.append("MIN_ACCUMULATOR_ODDS must be greater than 1.")
+    if MAX_ACCUMULATOR_ODDS < MIN_ACCUMULATOR_ODDS:
+        errors.append(
+            "MAX_ACCUMULATOR_ODDS must be >= MIN_ACCUMULATOR_ODDS."
+        )
+    if MIN_HOME_ODDS <= 1 or MAX_HOME_ODDS < MIN_HOME_ODDS:
+        errors.append("Invalid home odds range.")
+
+    for error in errors:
+        log.error("CONFIGURATION: %s", error)
+
+    return not errors
+
+
+def main_scanner_loop():
+    log.info("Background scanner started.")
+
+    while True:
+        try:
+            run_free_pipeline()
+        except Exception:
+            log.exception("Unexpected scanner failure.")
+
+        log.info(
+            "Next scan in %d seconds.",
+            POLL_DELAY_SECONDS,
+        )
+        time.sleep(POLL_DELAY_SECONDS)
 
 
 if __name__ == "__main__":
     if not validate_config():
-        raise SystemExit("Fix the configuration variables.")
+        raise SystemExit("Fix the environment variables and redeploy.")
 
+    # GitHub Actions can request a single scan without starting a server.
     if os.getenv("SCAN_ONCE", "0") == "1":
-        log.info("GitHub Actions single-scan mode.")
+        log.info("Single-scan mode activated.")
         run_free_pipeline()
-        log.info("Single scan completed.")
+        log.info("Single scan finished.")
+
     else:
+        threading.Thread(
+            target=start_port_listener,
+            daemon=True,
+        ).start()
+
         send_startup_test()
-        port = int(os.environ.get("PORT", "10000"))
-        uvicorn.run("bot:app", host="0.0.0.0", port=port)
+        main_scanner_loop()
