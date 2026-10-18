@@ -363,6 +363,39 @@ def lookup_sportybet(booking_code):
         if isinstance(data, dict):
             logging.info("DATA KEYS: %s", list(data.keys()))
 
+            data_dict = payload.get("data", {})
+            ticket = data_dict.get("ticket", {}) if isinstance(data_dict, dict) else {}
+
+            if isinstance(ticket, dict):
+                logging.info("TICKET SUMMARY VALUES: %s", {
+                    key: ticket.get(key)
+                    for key in (
+                        "orderType",
+                        "selections",
+                        "potentialWinnings",
+                        "totalStake",
+                        "displayTotalOdds",
+                        "displayBonus",
+                    )
+                })
+
+                for key in ("selections", "bets"):
+                    value = ticket.get(key)
+                    if isinstance(value, dict):
+                        logging.info("TICKET %s KEYS: %s", key, list(value.keys()))
+                    elif isinstance(value, list):
+                        logging.info(
+                            "TICKET %s: list length=%s",
+                            key, len(value)
+                        )
+                    else:
+                        logging.info(
+                            "TICKET %s TYPE: %s",
+                            key, type(value).__name__
+                        )
+
+            logging.info("SOURCE BET TYPE: %s", data_dict.get("betType"))
+
             for key, value in data.items():
                 if isinstance(value, dict):
                     logging.info(
