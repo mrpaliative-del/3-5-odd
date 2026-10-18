@@ -161,8 +161,8 @@ def normalize_text(value):
     return " ".join(value.split())
 
 
-def safe_fetch_json(url, label):
-    """Fetch a configured HTTPS feed and return payload plus safe diagnostics."""
+def safe_fetch_json(url, label, extra_headers=None):
+    """Fetch an HTTPS feed and return JSON plus safe diagnostics."""
     started = time.monotonic()
     diag = {
         "http_status": None, "content_type": None, "response_bytes": 0,
@@ -181,10 +181,13 @@ def safe_fetch_json(url, label):
         diag.update(status="invalid configuration", detail="Feed URL must be a valid HTTPS URL")
         return None, diag
 
-    request = Request(url, headers={
-        "Accept": "application/json",
-        "User-Agent": "SolveEaseDashboard/3.1 (+feed diagnostics)",
-    }, method="GET")
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    request = Request(url, headers=headers, method="GET")
     try:
         with urlopen(request, timeout=TIMEOUT) as response:
             diag["http_status"] = int(response.status)
@@ -439,6 +442,117 @@ def lookup_sportybet(code):
 # Odds feed normalization and analysis
 # ---------------------------------------------------------------------
 
+def prepare_feed_request(bookmaker_key, configured_url):
+    """Resolve known website-homepage settings to the documented data candidate."""
+    if bookmaker_key != "sportybet" or not configured_url:
+        return configured_url, {}
+
+    try:
+        parsed = urlsplit(configured_url)
+    except ValueError:
+        return configured_url, {}
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.rstrip("/").lower()
+    is_sportybet_site = host == "sportybet.com" or host.endswith(".sportybet.com")
+    # The user configured the public homepage/mobile page, not a data endpoint.
+    if is_sportybet_site and "/api/" not in path:
+        params = {
+            "sportId": "sr:sport:1",
+            "marketId": "1,18,10,29,11,26,36,14,60100",
+            "pageSize": "100",
+            "pageNum": "1",
+            "todayGames": "false",
+            "_t": str(int(time.time() * 1000)),
+        }
+        from urllib.parse import urlencode
+        url = "https://www.sportybet.com/api/ng/factsCenter/pcUpcomingEvents?" + urlencode(params)
+        return url, {
+            "Accept": "application/json, text/plain, */*",
+            "Current-Country": "NG",
+            "Origin": "https://www.sportybet.com",
+            "Referer": "https://www.sportybet.com/ng/",
+        }
+    return configured_url, {
+        "Current-Country": "NG",
+        "Referer": "https://www.sportybet.com/ng/",
+    }
+
+
+def adapt_sportybet_payload(payload):
+    """Convert SportyBet's nested factsCenter response into normalized event-market records.
+
+    Documented shape: data.tournaments[].events[].markets[].outcomes[].
+    This adapter deliberately does not invent probabilities or update timestamps.
+    """
+    if not isinstance(payload, dict):
+        return None, 0, "SportyBet JSON root is not an object"
+    biz_code = payload.get("bizCode")
+    if biz_code is not None and str(biz_code) not in ("10000", "0"):
+        return None, 0, f"SportyBet API returned bizCode {biz_code}"
+
+    data = payload.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("tournaments"), list):
+        return None, 0, "JSON received, but expected data.tournaments array from SportyBet factsCenter"
+
+    normalized = []
+    raw_market_count = 0
+    for tournament in data.get("tournaments", []):
+        if not isinstance(tournament, dict):
+            continue
+        tournament_name = str(tournament.get("name") or tournament.get("categoryName") or "Unknown league")
+        events = tournament.get("events")
+        if not isinstance(events, list):
+            continue
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            home = str(event.get("homeTeamName") or "").strip()
+            away = str(event.get("awayTeamName") or "").strip()
+            if not home or not away:
+                continue
+            event_name = f"{home} vs {away}"
+            markets = event.get("markets")
+            if not isinstance(markets, list):
+                continue
+            for market in markets:
+                if not isinstance(market, dict):
+                    continue
+                raw_market_count += 1
+                outcomes = market.get("outcomes")
+                if not isinstance(outcomes, list):
+                    continue
+                parsed_outcomes = []
+                for outcome in outcomes:
+                    if not isinstance(outcome, dict):
+                        continue
+                    odds = finite_number(outcome.get("odds"), minimum=1.000001)
+                    name = str(outcome.get("desc") or outcome.get("name") or "").strip()
+                    if odds is None or not name or outcome.get("isActive") is False:
+                        continue
+                    parsed_outcomes.append({
+                        "name": name,
+                        "odds": odds,
+                        # SportyBet's ordinary odds response does not provide a validated
+                        # model probability; never manufacture one from the odds.
+                    })
+                market_name = str(market.get("desc") or market.get("name") or "").strip()
+                specifier = str(market.get("specifier") or "").strip()
+                if specifier:
+                    market_name = f"{market_name} {specifier}".strip()
+                if not market_name:
+                    continue
+                normalized.append({
+                    "sport": "Football",
+                    "event": event_name,
+                    "market": market_name,
+                    "outcomes": parsed_outcomes,
+                    # Do not use scheduled kick-off as an odds-update timestamp.
+                    "updated_at": first_value(market, ["updated_at", "updatedAt", "lastUpdateTime", "updateTime"]),
+                    "league": tournament_name,
+                })
+    return normalized, raw_market_count, "SportyBet nested schema recognized"
+
+
 def normalize_feed_event(bookmaker_key, raw):
     if not isinstance(raw, dict):
         return None
@@ -489,27 +603,39 @@ def normalize_feed_event(bookmaker_key, raw):
 
 
 def fetch_all_feeds():
-    """Fetch all configured feeds and retain detailed, non-secret diagnostics."""
+    """Fetch feeds, adapt known source formats, and retain per-source diagnostics."""
     rows, health = [], []
     for key, config in BOOKMAKERS.items():
-        payload, diag = safe_fetch_json(config["feed_url"], config["name"])
+        request_url, headers = prepare_feed_request(key, config["feed_url"])
+        payload, diag = safe_fetch_json(request_url, config["name"], headers)
         diag["bookmaker"] = config["name"]
-        item = diag
         if payload is None:
-            health.append(item)
+            health.append(diag)
             continue
 
-        raw_events = payload.get("events")
-        if not isinstance(raw_events, list):
-            diag.update(status="invalid schema", schema_valid=False,
-                        detail='Valid JSON, but expected a top-level "events" array')
-            health.append(item)
-            continue
+        if key == "sportybet":
+            raw_events, raw_count, adapter_detail = adapt_sportybet_payload(payload)
+            if raw_events is None:
+                diag.update(status="invalid schema", schema_valid=False, detail=adapter_detail)
+                health.append(diag)
+                continue
+            diag["schema_valid"] = True
+            diag["raw_events"] = raw_count
+        else:
+            raw_events = payload.get("events")
+            if not isinstance(raw_events, list):
+                diag.update(status="invalid schema", schema_valid=False,
+                            detail='Valid JSON, but expected a top-level "events" array; source-specific adapter not yet implemented')
+                health.append(diag)
+                continue
+            diag["schema_valid"] = True
+            diag["raw_events"] = len(raw_events)
 
-        diag["schema_valid"] = True
-        diag["raw_events"] = len(raw_events)
         if not raw_events:
-            diag.update(status="no events", detail='Recognized "events" array is empty')
+            diag.update(status="no events", detail="Recognized feed schema, but no event-market records were returned")
+            health.append(diag)
+            continue
+
         rejection_reasons = {}
         newest_timestamp = None
         for raw in raw_events:
@@ -538,10 +664,10 @@ def fetch_all_feeds():
         elif diag["stale"] is True:
             diag.update(status="stale data", detail=f"Usable markets found, but newest event timestamp exceeds {STALE_AFTER_SECONDS}s or may be old")
         elif newest_timestamp is None:
-            diag.update(status="usable markets; freshness unknown", detail="Usable markets found; feed did not provide a parseable updated_at timestamp")
+            diag.update(status="usable markets; freshness unknown", detail="Usable markets found; source did not provide a parseable odds-update timestamp")
         else:
-            diag.update(status="usable markets", detail="JSON schema recognized and usable two-outcome markets parsed; source authenticity and odds accuracy are not independently verified")
-        health.append(item)
+            diag.update(status="usable markets", detail="Source schema recognized and usable two-outcome markets parsed; source authenticity and odds accuracy are not independently verified")
+        health.append(diag)
     return rows, health
 
 
@@ -1145,7 +1271,7 @@ loadHealth();
 # ---------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SolveEase/3.1"
+    server_version = "SolveEase/3.2"
 
     def log_message(self, fmt, *args):
         # Avoid logging query strings, POST bodies, and booking codes.
@@ -1224,7 +1350,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "status": "online",
                 "service": "SolveEase Booking & Arbitrage Dashboard",
-                "version": "3.1",
+                "version": "3.2",
                 "configured_feeds": configured,
                 "feed_status": feed_status,
                 "feed_freshness_threshold_seconds": STALE_AFTER_SECONDS,
@@ -1319,7 +1445,7 @@ def main():
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
-    logging.info("SolveEase dashboard v3.1 listening on port %s", PORT)
+    logging.info("SolveEase dashboard v3.2 listening on port %s", PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
