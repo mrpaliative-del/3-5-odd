@@ -1,4 +1,4 @@
-#!/usr/init/env python3
+#!/usr/bin/env python3
 """
 SolveEase SportyBet Booking-Code Dashboard
 Python standard library only.
@@ -355,6 +355,41 @@ def lookup_sportybet(booking_code):
                 }
             }
         )
+
+        data = payload.get("data")
+
+        logging.info("DATA TYPE: %s", type(data).__name__)
+
+        if isinstance(data, dict):
+            logging.info("DATA KEYS: %s", list(data.keys()))
+
+            for key, value in data.items():
+                if isinstance(value, dict):
+                    logging.info(
+                        "DATA NESTED OBJECT %s KEYS: %s",
+                        key, list(value.keys())
+                    )
+                elif isinstance(value, list):
+                    first_keys = (
+                        list(value[0].keys())
+                        if value and isinstance(value[0], dict)
+                        else []
+                    )
+                    logging.info(
+                        "DATA LIST %s: length=%s first_item_keys=%s",
+                        key, len(value), first_keys
+                    )
+
+        elif isinstance(data, list):
+            first_keys = (
+                list(data[0].keys())
+                if data and isinstance(data[0], dict)
+                else []
+            )
+            logging.info(
+                "DATA LIST: length=%s first_item_keys=%s",
+                len(data), first_keys
+            )
 
     if not isinstance(payload, (dict, list)):
         return {
