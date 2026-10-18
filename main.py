@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 SolveEase SportyBet Booking-Code Dashboard
@@ -12,8 +13,9 @@ Optional environment variables:
     SPORTYBET_TIMEOUT_SECONDS=15
 
 IMPORTANT:
-The SportyBet share endpoint used here is unofficial. A successful
-HTTP request does not guarantee the booking code can be resolved.
+The SportyBet share endpoint is unofficial. A successful HTTP request
+does not guarantee the booking code is valid or that all ticket details
+are complete. This application is read-only and does not place bets.
 """
 
 import json
@@ -54,12 +56,61 @@ LAST_LOOKUP_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------
-# SportyBet lookup
+# General helpers
 # ---------------------------------------------------------
 
-def find_outcomes(payload):
-    """Find a likely list of selection/outcome objects in a response."""
+def first_value(obj, keys, default=""):
+    """Return the first non-empty scalar value from a dictionary."""
+    if not isinstance(obj, dict):
+        return default
 
+    for key in keys:
+        value = obj.get(key)
+        if value is not None and value != "":
+            if isinstance(value, (str, int, float, bool)):
+                return value
+
+    return default
+
+
+def parse_positive_number(value):
+    """Parse a finite numeric value greater than one."""
+    if isinstance(value, bool) or value is None:
+        return None
+
+    try:
+        if isinstance(value, str):
+            value = value.strip().replace(",", "")
+            if not value:
+                return None
+
+        number = float(value)
+
+        if math.isfinite(number) and number > 1:
+            return number
+
+    except (TypeError, ValueError, OverflowError):
+        pass
+
+    return None
+
+
+def safe_ticket_value(value):
+    """Preserve source-provided scalar values without guessing units."""
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, (str, int)):
+        return value
+
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+
+    return None
+
+
+def find_outcomes(payload):
+    """Find a likely list of selection/outcome objects."""
     candidate_keys = (
         "outcomes",
         "selections",
@@ -92,12 +143,15 @@ def find_outcomes(payload):
 
 
 def inspect_ticket_data(legs):
-    """Summarize data quality without guessing missing values."""
+    """Summarize selection and odds data quality."""
     total = len(legs)
+
     odds_found = sum(
-        1 for leg in legs
+        1
+        for leg in legs
         if leg.get("odds_verified") is True
         and isinstance(leg.get("odds"), (int, float))
+        and not isinstance(leg.get("odds"), bool)
         and math.isfinite(leg["odds"])
         and leg["odds"] > 1
     )
@@ -106,39 +160,45 @@ def inspect_ticket_data(legs):
         "selections_found": total,
         "selections_with_odds": odds_found,
         "selections_missing_odds": total - odds_found,
-        "combined_odds_calculable": total > 0 and odds_found == total,
+        "combined_odds_calculable": (
+            total > 0 and odds_found == total
+        ),
     }
 
 
-def first_value(obj, keys, default=""):
-    """Return the first non-empty matching field."""
-
-    if not isinstance(obj, dict):
-        return default
-
-    for key in keys:
-        value = obj.get(key)
-        if value is not None and value != "":
-            if isinstance(value, (str, int, float, bool)):
-                return value
-
-    return default
-
+# ---------------------------------------------------------
+# Selection normalization
+# ---------------------------------------------------------
 
 def normalize_leg(item, index):
-    """Extract a selection without guessing between possible outcomes."""
+    """
+    Extract a selection without guessing between possible outcomes.
 
+    An outcome is trusted only when an explicit selection marker
+    identifies exactly one outcome, or only one valid outcome exists.
+    """
     event = first_value(
         item,
-        ("eventName", "event_name", "matchName", "match",
-         "fixtureName", "homeAwayName"),
+        (
+            "eventName",
+            "event_name",
+            "matchName",
+            "match",
+            "fixtureName",
+            "homeAwayName",
+        ),
         "",
     )
 
     if not event:
         home = first_value(item, ("homeTeamName",), "")
         away = first_value(item, ("awayTeamName",), "")
-        event = f"{home} vs {away}" if home and away else "Event details unavailable"
+
+        event = (
+            f"{home} vs {away}"
+            if home and away
+            else "Event details unavailable"
+        )
 
     markets = item.get("markets", [])
     candidates = []
@@ -159,7 +219,7 @@ def normalize_leg(item, index):
 
                 try:
                     odds = float(outcome.get("odds"))
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     continue
 
                 if not math.isfinite(odds) or odds <= 1:
@@ -168,38 +228,57 @@ def normalize_leg(item, index):
                 candidate = (market, outcome, odds)
                 candidates.append(candidate)
 
-                # Only trust explicit selection markers, not list order.
                 marker = next(
                     (
                         outcome[key]
-                        for key in ("isSelected", "selected", "chosen",
-                                    "betSelected")
+                        for key in (
+                            "isSelected",
+                            "selected",
+                            "chosen",
+                            "betSelected",
+                        )
                         if key in outcome
                     ),
                     None,
                 )
-                if marker is True or marker == 1 or marker == "true":
+
+                if (
+                    marker is True
+                    or marker == 1
+                    or (
+                        isinstance(marker, str)
+                        and marker.lower() == "true"
+                    )
+                ):
                     explicitly_selected.append(candidate)
 
     chosen = None
 
     if len(explicitly_selected) == 1:
         chosen = explicitly_selected[0]
-    elif len(explicitly_selected) == 0 and len(candidates) == 1:
-        # Safe only when the response provides exactly one valid outcome.
+    elif (
+        len(explicitly_selected) == 0
+        and len(candidates) == 1
+    ):
         chosen = candidates[0]
 
     if chosen is not None:
         market, outcome, odds = chosen
+
         market_name = first_value(
-            market, ("desc", "marketName", "marketDesc", "name"),
+            market,
+            ("desc", "marketName", "marketDesc", "name"),
             "Market unavailable",
         )
+
         selection_name = first_value(
-            outcome, ("desc", "outcomeName", "selectionName", "name"),
+            outcome,
+            ("desc", "outcomeName", "selectionName", "name"),
             "Selection details unavailable",
         )
+
         odds_verified = True
+
     else:
         market_name = "Selection market needs verification"
         selection_name = "Selected outcome not identifiable"
@@ -208,8 +287,14 @@ def normalize_leg(item, index):
 
     kickoff = first_value(
         item,
-        ("estimateStartTime", "matchTime", "startTime",
-         "eventTime", "kickoff", "beginTime"),
+        (
+            "estimateStartTime",
+            "matchTime",
+            "startTime",
+            "eventTime",
+            "kickoff",
+            "beginTime",
+        ),
         "",
     )
 
@@ -224,87 +309,9 @@ def normalize_leg(item, index):
     }
 
 
-def find_text_fields(payload):
-    """Search common ticket-level fields without assuming a schema."""
-
-    result = {}
-
-    wanted = {
-        "status": (
-            "status", "orderStatus", "betStatus", "state",
-        ),
-        "stake": (
-            "stake", "betAmount", "orderAmount", "amount",
-        ),
-        "potential_return": (
-            "potentialReturn", "maxReturn", "possibleWin",
-            "returnAmount",
-        ),
-        "booking_code": (
-            "shareCode", "bookingCode", "orderCode",
-        ),
-        "currency": ("currency", "currencyCode"),
-    }
-
-    def walk(node):
-        if isinstance(node, dict):
-            for output_key, aliases in wanted.items():
-                if output_key in result:
-                    continue
-
-                for alias in aliases:
-                    value = node.get(alias)
-                    if value is not None and value != "":
-                        if isinstance(value, (str, int, float)):
-                            result[output_key] = value
-                            break
-
-            for value in node.values():
-                walk(value)
-
-        elif isinstance(node, list):
-            for item in node:
-                walk(item)
-
-    walk(payload)
-    return result
-
-
-def parse_positive_number(value):
-    """Parse a finite positive number, including formatted numeric strings."""
-    if isinstance(value, bool) or value is None:
-        return None
-
-    try:
-        if isinstance(value, str):
-            value = value.strip().replace(",", "")
-            if not value:
-                return None
-
-        number = float(value)
-
-        if math.isfinite(number) and number > 1:
-            return number
-
-    except (TypeError, ValueError, OverflowError):
-        pass
-
-    return None
-
-
-def safe_ticket_value(value):
-    """Keep source-provided scalar values; do not guess object formats."""
-    if isinstance(value, bool):
-        return value
-
-    if isinstance(value, (str, int)):
-        return value
-
-    if isinstance(value, float) and math.isfinite(value):
-        return value
-
-    return None
-
+# ---------------------------------------------------------
+# SportyBet lookup
+# ---------------------------------------------------------
 
 def lookup_sportybet(booking_code):
     """Fetch a shared booking code from SportyBet's unofficial endpoint."""
@@ -328,11 +335,13 @@ def lookup_sportybet(booking_code):
         with urlopen(request, timeout=REQUEST_TIMEOUT) as response:
             status_code = response.status
             raw_body = response.read(2_000_000).decode(
-                "utf-8", errors="replace"
+                "utf-8",
+                errors="replace",
             )
 
     except HTTPError as exc:
         logging.warning("SportyBet returned HTTP %s", exc.code)
+
         if exc.code in (401, 403, 429):
             return {
                 "ok": False,
@@ -341,13 +350,19 @@ def lookup_sportybet(booking_code):
                     "Try again later or use SportyBet's official website."
                 ),
             }
+
         return {
             "ok": False,
             "error": f"SportyBet returned HTTP {exc.code}.",
         }
 
     except (URLError, TimeoutError, OSError) as exc:
-        logging.warning("SportyBet request failed: %s", exc)
+        # Do not log the booking code or the complete request URL.
+        logging.warning(
+            "SportyBet request failed: %s",
+            type(exc).__name__,
+        )
+
         return {
             "ok": False,
             "error": (
@@ -366,6 +381,7 @@ def lookup_sportybet(booking_code):
         payload = json.loads(raw_body)
     except json.JSONDecodeError:
         logging.warning("SportyBet returned a non-JSON response")
+
         return {
             "ok": False,
             "error": (
@@ -380,27 +396,34 @@ def lookup_sportybet(booking_code):
             "error": "SportyBet returned an unexpected response.",
         }
 
-    logging.info("RESPONSE TOP-LEVEL KEYS: %s", list(payload.keys()))
+    # Log field names and safe response metadata only.
     logging.info(
-        "RESPONSE TOP-LEVEL SCALAR FIELDS: %s",
+        "SportyBet response top-level keys: %s",
+        list(payload.keys()),
+    )
+
+    logging.info(
+        "SportyBet response result: %s",
         {
-            key: value
-            for key, value in payload.items()
-            if not isinstance(value, (dict, list))
-            and key.lower() not in {
-                "sharecode", "bookingcode", "ordercode"
-            }
+            "bizCode": payload.get("bizCode"),
+            "isAvailable": payload.get("isAvailable"),
+            "message": payload.get("message"),
         },
     )
 
     biz_code = payload.get("bizCode")
+
     if biz_code is not None and str(biz_code) != "10000":
         message = first_value(
             payload,
             ("message", "msg", "errorMsg", "error"),
             "SportyBet did not accept this booking code.",
         )
-        return {"ok": False, "error": str(message)}
+
+        return {
+            "ok": False,
+            "error": str(message),
+        }
 
     data = payload.get("data")
     if not isinstance(data, dict):
@@ -410,35 +433,50 @@ def lookup_sportybet(booking_code):
     if not isinstance(ticket, dict):
         ticket = {}
 
-    logging.info("DATA KEYS: %s", list(data.keys()))
-    logging.info(
-        "TICKET SUMMARY VALUES: %s",
-        {
-            key: ticket.get(key)
-            for key in (
-                "orderType",
-                "potentialWinnings",
-                "totalStake",
-                "displayTotalOdds",
-                "displayBonus",
-            )
-        },
-    )
+    ticket_selections = ticket.get("selections")
+    if not isinstance(ticket_selections, list):
+        ticket_selections = []
 
     raw_legs = data.get("outcomes")
     if not isinstance(raw_legs, list) or not raw_legs:
         raw_legs = find_outcomes(payload)
 
-    ticket_selections = ticket.get("selections")
-    if not isinstance(ticket_selections, list):
-        ticket_selections = []
-
     source_selection_count = (
-        len(ticket_selections) if ticket_selections else len(raw_legs)
+        len(ticket_selections)
+        if ticket_selections
+        else len(raw_legs)
     )
 
-    if not raw_legs:
+    logging.info(
+        "Ticket summary availability: %s",
+        {
+            "order_type_available": ticket.get("orderType") is not None,
+            "stake_available": ticket.get("totalStake") is not None,
+            "potential_return_available": (
+                ticket.get("potentialWinnings") is not None
+            ),
+            "display_total_odds_available": (
+                ticket.get("displayTotalOdds") is not None
+            ),
+            "ticket_selection_count": (
+                len(ticket_selections)
+                if ticket_selections
+                else None
+            ),
+            "returned_outcome_count": (
+                len(raw_legs) if isinstance(raw_legs, list) else 0
+            ),
+            "unavailable_outcome_count": (
+                len(data.get("unavailableOutcomes", []))
+                if isinstance(data.get("unavailableOutcomes"), list)
+                else None
+            ),
+        },
+    )
+
+    if not isinstance(raw_legs, list) or not raw_legs:
         logging.info("No recognizable selections were returned")
+
         return {
             "ok": False,
             "error": (
@@ -447,11 +485,6 @@ def lookup_sportybet(booking_code):
             ),
             "source_status": status_code,
         }
-
-    logging.info(
-        "SOURCE SELECTION COUNT: %s",
-        len(raw_legs),
-    )
 
     legs = [
         normalize_leg(item, index)
@@ -466,11 +499,14 @@ def lookup_sportybet(booking_code):
         }
 
     diagnostics = inspect_ticket_data(legs)
+
     logging.info(
         "Ticket data quality: %s",
         json.dumps(diagnostics),
     )
 
+    # SportyBet's own displayed total odds are preferred.
+    # Our multiplication is retained as a separate diagnostic.
     source_combined_odds = parse_positive_number(
         ticket.get("displayTotalOdds")
     )
@@ -480,6 +516,7 @@ def lookup_sportybet(booking_code):
         for leg in legs
         if leg.get("odds_verified") is True
         and isinstance(leg.get("odds"), (int, float))
+        and not isinstance(leg.get("odds"), bool)
         and math.isfinite(leg["odds"])
         and leg["odds"] > 1
     ]
@@ -496,6 +533,8 @@ def lookup_sportybet(booking_code):
         else calculated_odds
     )
 
+    # Read status only from the ticket object. Do not search nested
+    # event objects, which may have unrelated match-level statuses.
     status = first_value(
         ticket,
         ("status", "orderStatus", "betStatus", "state"),
@@ -505,28 +544,45 @@ def lookup_sportybet(booking_code):
     result = {
         "ok": True,
         "booking_code": booking_code,
-        "selections_count": source_selection_count,
+
+        # The visible count is the number of legs actually displayed.
+        "selections_count": len(legs),
         "displayed_selections_count": len(legs),
+
+        # Preserve the source ticket count for discrepancy checks.
+        "source_selection_count": source_selection_count,
+
         "legs": legs,
+
+        # Primary odds value and independent diagnostic values.
         "combined_odds": combined_odds,
+        "source_combined_odds": source_combined_odds,
         "calculated_combined_odds": calculated_odds,
+
         "diagnostics": diagnostics,
         "status": status,
+
+        # These values are preserved exactly as source scalars.
+        # Currency and scaling have not been independently verified.
         "stake": safe_ticket_value(ticket.get("totalStake")),
         "potential_return": safe_ticket_value(
             ticket.get("potentialWinnings")
         ),
-        "currency": "NGN",
+        "currency": None,
+
         "retrieved_at": datetime.now(timezone.utc).isoformat(),
         "source": "SportyBet unofficial share endpoint",
         "note": (
             "Ticket details are sourced from SportyBet's response. "
-            "Verify the stake, potential return, odds and selections "
-            "on SportyBet before making any decision."
+            "Stake and potential return are shown as source values; "
+            "their currency and units have not been independently "
+            "verified. Verify the stake, potential return, odds and "
+            "selections on SportyBet before making any decision."
         ),
     }
 
     global LAST_LOOKUP
+
     with LAST_LOOKUP_LOCK:
         LAST_LOOKUP = {
             "at": result["retrieved_at"],
@@ -535,15 +591,25 @@ def lookup_sportybet(booking_code):
         }
 
     logging.info(
-        "Booking lookup returned %s selections",
+        "Booking lookup completed: displayed selections=%s, "
+        "source selections=%s",
         len(legs),
+        source_selection_count,
     )
+
     logging.info(
-        "SUMMARY FIELD AVAILABILITY: %s",
+        "Summary field availability: %s",
         {
-            "source_combined_odds_available": source_combined_odds is not None,
+            "source_combined_odds_available": (
+                source_combined_odds is not None
+            ),
+            "calculated_combined_odds_available": (
+                calculated_odds is not None
+            ),
             "stake_available": result["stake"] is not None,
-            "potential_return_available": result["potential_return"] is not None,
+            "potential_return_available": (
+                result["potential_return"] is not None
+            ),
             "overall_status_available": status != "Not provided",
         },
     )
@@ -680,12 +746,34 @@ footer { font-size:12px; color:var(--muted); margin-top:24px; }
 <section id="results" class="panel hidden">
   <h2>Ticket summary</h2>
   <div class="grid">
-    <div class="stat"><span>Selections</span><strong id="count">—</strong></div>
-    <div class="stat"><span>Combined odds</span><strong id="combined">—</strong></div>
-    <div class="stat"><span>Ticket status</span><strong id="status">—</strong></div>
-    <div class="stat"><span>Stake</span><strong id="stake">—</strong></div>
-    <div class="stat"><span>Potential return</span><strong id="returns">—</strong></div>
+    <div class="stat">
+      <span>Displayed selections</span>
+      <strong id="count">—</strong>
+    </div>
+    <div class="stat">
+      <span>SportyBet total odds</span>
+      <strong id="combined">—</strong>
+    </div>
+    <div class="stat">
+      <span>Calculated odds (diagnostic)</span>
+      <strong id="calculated">—</strong>
+    </div>
+    <div class="stat">
+      <span>Ticket status</span>
+      <strong id="status">—</strong>
+    </div>
+    <div class="stat">
+      <span>Stake (source value)</span>
+      <strong id="stake">—</strong>
+    </div>
+    <div class="stat">
+      <span>Potential return (source value)</span>
+      <strong id="returns">—</strong>
+    </div>
   </div>
+
+  <p id="countNote" class="small"></p>
+
   <h2>Selections</h2>
   <div id="legs"></div>
   <p id="retrieved" class="small"></p>
@@ -721,43 +809,85 @@ function setMessage(text, kind) {
 }
 
 function displayValue(value) {
-  if (value === null || value === undefined || value === "") return "Not provided";
+  if (value === null || value === undefined || value === "") {
+    return "Not provided";
+  }
   return String(value);
+}
+
+function formatOdds(value) {
+  if (value === null || value === undefined || value === "") {
+    return "Unavailable";
+  }
+
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return "Unavailable";
+  }
+
+  return number.toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  });
 }
 
 function addTextElement(parent, tag, text, className) {
   const element = document.createElement(tag);
   element.textContent = text;
-  if (className) element.className = className;
+
+  if (className) {
+    element.className = className;
+  }
+
   parent.appendChild(element);
   return element;
 }
 
 function renderTicket(data) {
-  document.getElementById("count").textContent =
-    displayValue(data.selections_count);
+  const displayedCount =
+    data.displayed_selections_count ?? data.selections_count;
 
+  document.getElementById("count").textContent =
+    displayValue(displayedCount);
+
+  // Prefer the source-provided total when available.
   document.getElementById("combined").textContent =
-    data.combined_odds == null
-      ? (
-          data.diagnostics
-            ? data.diagnostics.selections_with_odds + " of " +
-              data.diagnostics.selections_found + " odds found"
-            : "Unavailable"
-        )
-      : Number(data.combined_odds).toFixed(2);
+    data.source_combined_odds != null
+      ? formatOdds(data.source_combined_odds)
+      : formatOdds(data.combined_odds);
+
+  document.getElementById("calculated").textContent =
+    formatOdds(data.calculated_combined_odds);
 
   document.getElementById("status").textContent =
     displayValue(data.status);
 
-  const currency = data.currency || "NGN";
+  // Never assume a currency or scale for source amounts.
   document.getElementById("stake").textContent =
-    data.stake == null ? "Not provided" :
-    currency + " " + data.stake;
+    data.stake == null
+      ? "Not provided"
+      : String(data.stake) + " (units unverified)";
 
   document.getElementById("returns").textContent =
-    data.potential_return == null ? "Not provided" :
-    currency + " " + data.potential_return;
+    data.potential_return == null
+      ? "Not provided"
+      : String(data.potential_return) + " (units unverified)";
+
+  const sourceCount = data.source_selection_count;
+  const countNote = document.getElementById("countNote");
+
+  if (
+    Number.isInteger(sourceCount) &&
+    Number.isInteger(displayedCount) &&
+    sourceCount !== displayedCount
+  ) {
+    countNote.textContent =
+      "Source ticket records: " + sourceCount +
+      "; outcome records displayed: " + displayedCount +
+      ". The counts differ in the source response.";
+  } else {
+    countNote.textContent = "";
+  }
 
   const legsBox = document.getElementById("legs");
   legsBox.replaceChildren();
@@ -767,28 +897,36 @@ function renderTicket(data) {
     card.className = "leg";
 
     addTextElement(
-      card, "h3",
+      card,
+      "h3",
       String(leg.number) + ". " + displayValue(leg.event)
     );
 
     addTextElement(
-      card, "p", "Market: " + displayValue(leg.market)
+      card,
+      "p",
+      "Market: " + displayValue(leg.market)
     );
 
     addTextElement(
-      card, "p", "Selection: " + displayValue(leg.selection)
+      card,
+      "p",
+      "Selection: " + displayValue(leg.selection)
     );
 
     addTextElement(
-      card, "p",
-      "Odds: " + (leg.odds == null
-        ? "Not provided"
-        : Number(leg.odds).toFixed(2)),
+      card,
+      "p",
+      "Odds: " + formatOdds(leg.odds),
       "odd"
     );
 
-    if (leg.kickoff !== "") {
-      addTextElement(card, "p", "Time: " + String(leg.kickoff));
+    if (leg.kickoff !== "" && leg.kickoff != null) {
+      addTextElement(
+        card,
+        "p",
+        "Time: " + String(leg.kickoff)
+      );
     }
 
     legsBox.appendChild(card);
@@ -830,10 +968,18 @@ form.addEventListener("submit", async function(event) {
       body: JSON.stringify({booking_code: bookingCode})
     });
 
-    const data = await response.json();
+    let data;
+
+    try {
+      data = await response.json();
+    } catch (_) {
+      throw new Error("The server returned an unreadable response.");
+    }
 
     if (!response.ok || !data.ok) {
-      throw new Error(data.error || "The lookup could not be completed.");
+      throw new Error(
+        data.error || "The lookup could not be completed."
+      );
     }
 
     renderTicket(data);
@@ -855,11 +1001,16 @@ async function loadHealth() {
 
   try {
     const response = await fetch("/health");
+    if (!response.ok) {
+      throw new Error("Health request failed.");
+    }
+
     const data = await response.json();
 
     target.textContent = data.status === "online"
       ? "Online · API route available"
       : "Service response received";
+
   } catch (_) {
     target.textContent = "Could not check service status.";
   }
@@ -877,8 +1028,7 @@ loadHealth();
 # ---------------------------------------------------------
 
 class SolveEaseHandler(BaseHTTPRequestHandler):
-
-    server_version = "SolveEase/1.0"
+    server_version = "SolveEase/1.1"
 
     def log_message(self, fmt, *args):
         logging.info(
@@ -935,16 +1085,22 @@ class SolveEaseHandler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         path = urlsplit(self.path).path.rstrip("/") or "/"
+
         if path in ("/", "/health", "/state"):
             if path == "/":
                 body = HTML.encode("utf-8")
                 self.send_bytes(
-                    200, body, "text/html; charset=utf-8"
+                    200,
+                    body,
+                    "text/html; charset=utf-8",
                 )
             else:
                 self.send_json(200, {"status": "online"})
         else:
-            self.send_json(404, {"ok": False, "error": "Not found."})
+            self.send_json(
+                404,
+                {"ok": False, "error": "Not found."},
+            )
 
     def do_GET(self):
         path = urlsplit(self.path).path.rstrip("/") or "/"
@@ -964,125 +1120,165 @@ class SolveEaseHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/analyse":
-            self.send_json(405, {
-                "ok": False,
-                "error": (
-                    "This endpoint requires POST. Open the dashboard, "
-                    "enter a booking code, and tap Look up ticket."
-                ),
-                "expected_method": "POST",
-                "expected_path": "/api/analyse",
-            })
+            self.send_json(
+                405,
+                {
+                    "ok": False,
+                    "error": (
+                        "This endpoint requires POST. Open the dashboard, "
+                        "enter a booking code, and tap Look up ticket."
+                    ),
+                    "expected_method": "POST",
+                    "expected_path": "/api/analyse",
+                },
+            )
             return
 
         if path == "/health":
             with LAST_LOOKUP_LOCK:
                 last_lookup = LAST_LOOKUP
 
-            self.send_json(200, {
-                "status": "online",
-                "service": "SolveEase Booking-Code Dashboard",
-                "api_route": "/api/analyse",
-                "sportybet_lookup": "unofficial endpoint",
-                "bankroll_configured": BANKROLL >= 0,
-                "last_lookup": last_lookup,
-                "uptime_seconds": int(time.time() - APP_STARTED),
-            })
+            self.send_json(
+                200,
+                {
+                    "status": "online",
+                    "service": "SolveEase Booking-Code Dashboard",
+                    "api_route": "/api/analyse",
+                    "sportybet_lookup": "unofficial endpoint",
+                    "bankroll_configured": BANKROLL >= 0,
+                    "last_lookup": last_lookup,
+                    "uptime_seconds": int(time.time() - APP_STARTED),
+                },
+            )
             return
 
         if path == "/state":
             with LAST_LOOKUP_LOCK:
                 last_lookup = LAST_LOOKUP
 
-            self.send_json(200, {
-                "status": "online",
-                "last_lookup": last_lookup,
-            })
+            self.send_json(
+                200,
+                {
+                    "status": "online",
+                    "last_lookup": last_lookup,
+                },
+            )
             return
 
-        logging.warning("Unmatched GET route: %s", self.path)
+        # Do not log query strings, which may contain sensitive values.
+        logging.warning("Unmatched GET route")
 
-        self.send_json(404, {
-            "ok": False,
-            "error": "Route not found.",
-            "requested_path": path,
-            "hint": "Open the dashboard homepage.",
-        })
-
-    def do_POST(self):
-        if self.path != "/api/analyse":
-            self.send_json(404, {
+        self.send_json(
+            404,
+            {
                 "ok": False,
                 "error": "Route not found.",
-            })
+                "requested_path": path,
+                "hint": "Open the dashboard homepage.",
+            },
+        )
+
+    def do_POST(self):
+        path = urlsplit(self.path).path
+
+        if path != "/api/analyse":
+            self.send_json(
+                404,
+                {"ok": False, "error": "Route not found."},
+            )
             return
 
         content_type = self.headers.get("Content-Type", "")
+
         if "application/json" not in content_type.lower():
-            self.send_json(415, {
-                "ok": False,
-                "error": "Send the booking code through the dashboard form.",
-            })
+            self.send_json(
+                415,
+                {
+                    "ok": False,
+                    "error": (
+                        "Send the booking code through the dashboard form."
+                    ),
+                },
+            )
             return
 
         try:
             body = self.read_json_body()
         except ValueError as exc:
-            self.send_json(400, {
-                "ok": False,
-                "error": str(exc),
-            })
+            self.send_json(
+                400,
+                {"ok": False, "error": str(exc)},
+            )
             return
 
         if not isinstance(body, dict):
-            self.send_json(400, {
-                "ok": False,
-                "error": "Expected a booking-code object.",
-            })
+            self.send_json(
+                400,
+                {
+                    "ok": False,
+                    "error": "Expected a booking-code object.",
+                },
+            )
             return
 
         booking_code = body.get("booking_code", "")
 
         if not isinstance(booking_code, str):
-            self.send_json(400, {
-                "ok": False,
-                "error": "Booking code must be text.",
-            })
+            self.send_json(
+                400,
+                {
+                    "ok": False,
+                    "error": "Booking code must be text.",
+                },
+            )
             return
 
         booking_code = booking_code.strip()
 
         if not booking_code:
-            self.send_json(400, {
-                "ok": False,
-                "error": "Enter a booking code.",
-            })
+            self.send_json(
+                400,
+                {"ok": False, "error": "Enter a booking code."},
+            )
             return
 
         if len(booking_code) > 120:
-            self.send_json(400, {
-                "ok": False,
-                "error": "Booking code must be 120 characters or fewer.",
-            })
+            self.send_json(
+                400,
+                {
+                    "ok": False,
+                    "error": (
+                        "Booking code must be 120 characters or fewer."
+                    ),
+                },
+            )
             return
 
         if re.search(r"[\x00-\x1f\x7f]", booking_code):
-            self.send_json(400, {
-                "ok": False,
-                "error": "Booking code contains invalid characters.",
-            })
+            self.send_json(
+                400,
+                {
+                    "ok": False,
+                    "error": "Booking code contains invalid characters.",
+                },
+            )
             return
 
+        # Intentionally do not log the booking code itself.
         logging.info("Received booking-code lookup request")
 
         try:
             result = lookup_sportybet(booking_code)
         except Exception:
             logging.exception("Unexpected booking lookup error")
-            self.send_json(500, {
-                "ok": False,
-                "error": "Unexpected server error during lookup.",
-            })
+
+            self.send_json(
+                500,
+                {
+                    "ok": False,
+                    "error": "Unexpected server error during lookup.",
+                },
+            )
             return
 
         if not result.get("ok"):
@@ -1108,7 +1304,10 @@ def main():
     server = ThreadingHTTPServer((HOST, PORT), SolveEaseHandler)
     server.daemon_threads = True
 
-    logging.info("SolveEase dashboard listening on port %s", PORT)
+    logging.info(
+        "SolveEase dashboard listening on port %s",
+        PORT,
+    )
     logging.info("Booking-code lookup route: POST /api/analyse")
     logging.info("SportyBet lookup endpoint configured")
     logging.info("No predefined booking codes are required")
