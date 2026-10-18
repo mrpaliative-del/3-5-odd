@@ -425,11 +425,17 @@ def lookup_sportybet(booking_code):
         },
     )
 
-    # Use the endpoint's explicit selection list when available.
-    # Fall back to recursive discovery only if it is absent or empty.
     raw_legs = data.get("outcomes")
     if not isinstance(raw_legs, list) or not raw_legs:
         raw_legs = find_outcomes(payload)
+
+    ticket_selections = ticket.get("selections")
+    if not isinstance(ticket_selections, list):
+        ticket_selections = []
+
+    source_selection_count = (
+        len(ticket_selections) if ticket_selections else len(raw_legs)
+    )
 
     if not raw_legs:
         logging.info("No recognizable selections were returned")
@@ -465,8 +471,6 @@ def lookup_sportybet(booking_code):
         json.dumps(diagnostics),
     )
 
-    # Prefer SportyBet's ticket-level combined odds.
-    # Fall back to multiplying verified selection odds.
     source_combined_odds = parse_positive_number(
         ticket.get("displayTotalOdds")
     )
@@ -492,32 +496,26 @@ def lookup_sportybet(booking_code):
         else calculated_odds
     )
 
-    # These are ticket-level fields, not individual event fields.
-    stake = safe_ticket_value(ticket.get("totalStake"))
-    potential_return = safe_ticket_value(
-        ticket.get("potentialWinnings")
-    )
-
-    # Only report an overall status if the ticket object actually
-    # supplies one. Never use a match's status or bookingStatus.
     status = first_value(
         ticket,
         ("status", "orderStatus", "betStatus", "state"),
         "Not provided",
     )
 
-    # Currency is retained as NGN for this Nigeria-specific endpoint.
-    # Amounts are not converted because their units have not been verified.
     result = {
         "ok": True,
         "booking_code": booking_code,
-        "selections_count": len(legs),
+        "selections_count": source_selection_count,
+        "displayed_selections_count": len(legs),
         "legs": legs,
         "combined_odds": combined_odds,
+        "calculated_combined_odds": calculated_odds,
         "diagnostics": diagnostics,
         "status": status,
-        "stake": stake,
-        "potential_return": potential_return,
+        "stake": safe_ticket_value(ticket.get("totalStake")),
+        "potential_return": safe_ticket_value(
+            ticket.get("potentialWinnings")
+        ),
         "currency": "NGN",
         "retrieved_at": datetime.now(timezone.utc).isoformat(),
         "source": "SportyBet unofficial share endpoint",
@@ -544,8 +542,8 @@ def lookup_sportybet(booking_code):
         "SUMMARY FIELD AVAILABILITY: %s",
         {
             "source_combined_odds_available": source_combined_odds is not None,
-            "stake_available": stake is not None,
-            "potential_return_available": potential_return is not None,
+            "stake_available": result["stake"] is not None,
+            "potential_return_available": result["potential_return"] is not None,
             "overall_status_available": status != "Not provided",
         },
     )
