@@ -74,6 +74,7 @@ MIN_PROBABILITY = float(os.environ.get("MIN_PROBABILITY", "0.60"))
 BANKROLL = float(os.environ.get("BANKROLL", "100000"))
 MAX_FEED_BYTES = 3_000_000
 MAX_LOOKUP_BYTES = 2_000_000
+STALE_AFTER_SECONDS = max(30, int(os.environ.get("FEED_STALE_AFTER_SECONDS", "300")))
 
 SPORTYBET_SHARE_URL = "https://www.sportybet.com/api/ng/orders/share/"
 
@@ -111,6 +112,7 @@ STARTED_AT = time.time()
 STATE_LOCK = threading.Lock()
 LAST_SCAN = None
 LAST_LOOKUP = None
+LAST_FEED_STATUS = None
 
 
 def now_iso():
@@ -160,41 +162,82 @@ def normalize_text(value):
 
 
 def safe_fetch_json(url, label):
-    """Fetch a server-configured HTTPS URL; never accept a URL from a user."""
+    """Fetch a configured HTTPS feed and return payload plus safe diagnostics."""
+    started = time.monotonic()
+    diag = {
+        "http_status": None, "content_type": None, "response_bytes": 0,
+        "fetch_ms": 0, "json_valid": False, "schema_valid": False,
+        "raw_events": 0, "events_loaded": 0, "events_rejected": 0,
+        "rejection_reasons": {}, "last_successful_fetch": None,
+        "data_updated_at": None, "freshness_seconds": None,
+        "stale": None, "detail": "", "status": "not configured",
+    }
     if not url:
-        return None, "No feed URL configured"
+        diag["detail"] = "No feed URL configured; endpoint has not been tested"
+        return None, diag
 
     parsed = urlsplit(url)
     if parsed.scheme != "https" or not parsed.hostname:
-        return None, "Feed URL must be a valid HTTPS URL"
+        diag.update(status="invalid configuration", detail="Feed URL must be a valid HTTPS URL")
+        return None, diag
 
-    request = Request(
-        url,
-        headers={
-            "Accept": "application/json",
-            "User-Agent": "SolveEaseDashboard/3.0",
-        },
-        method="GET",
-    )
+    request = Request(url, headers={
+        "Accept": "application/json",
+        "User-Agent": "SolveEaseDashboard/3.1 (+feed diagnostics)",
+    }, method="GET")
     try:
         with urlopen(request, timeout=TIMEOUT) as response:
-            if response.status != 200:
-                return None, f"HTTP {response.status}"
+            diag["http_status"] = int(response.status)
+            diag["content_type"] = response.headers.get("Content-Type", "")[:160]
             body = response.read(MAX_FEED_BYTES + 1)
+            diag["response_bytes"] = len(body)
             if len(body) > MAX_FEED_BYTES:
-                return None, "Feed response exceeded size limit"
-            payload = json.loads(body.decode("utf-8", errors="replace"))
-            if not isinstance(payload, dict):
-                return None, "Feed must return a JSON object"
-            return payload, "OK"
+                diag.update(status="response too large", detail=f"Response exceeded {MAX_FEED_BYTES} byte limit")
+                return None, diag
+            if not 200 <= response.status < 300:
+                diag.update(status="http error", detail=f"HTTP {response.status}")
+                return None, diag
     except HTTPError as exc:
+        diag["http_status"] = int(exc.code)
+        diag["content_type"] = exc.headers.get("Content-Type", "")[:160] if exc.headers else ""
+        diag.update(status="http error", detail=f"HTTP {exc.code}")
         logging.warning("%s feed returned HTTP %s", label, exc.code)
-        return None, f"HTTP {exc.code}"
+        return None, diag
     except (URLError, TimeoutError, OSError) as exc:
-        logging.warning("%s feed failed: %s", label, type(exc).__name__)
-        return None, "Network request failed"
+        diag.update(status="fetch failed", detail=f"Network request failed ({type(exc).__name__})")
+        logging.warning("%s feed request failed: %s", label, type(exc).__name__)
+        return None, diag
+    finally:
+        diag["fetch_ms"] = round((time.monotonic() - started) * 1000)
+
+    try:
+        payload = json.loads(body.decode("utf-8-sig"))
+        diag["json_valid"] = True
     except (json.JSONDecodeError, UnicodeDecodeError):
-        return None, "Feed returned invalid JSON"
+        diag.update(status="invalid response", detail="Response is not valid UTF-8 JSON; endpoint may return HTML or an anti-bot page")
+        return None, diag
+    if not isinstance(payload, dict):
+        diag.update(status="invalid response", detail="JSON root must be an object")
+        return None, diag
+    diag["last_successful_fetch"] = now_iso()
+    diag["status"] = "json received"
+    diag["detail"] = "Valid JSON received; feed schema not yet confirmed"
+    return payload, diag
+
+
+def parse_timestamp(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return None
 
 
 # ---------------------------------------------------------------------
@@ -446,35 +489,59 @@ def normalize_feed_event(bookmaker_key, raw):
 
 
 def fetch_all_feeds():
+    """Fetch all configured feeds and retain detailed, non-secret diagnostics."""
     rows, health = [], []
     for key, config in BOOKMAKERS.items():
-        payload, message = safe_fetch_json(config["feed_url"], config["name"])
+        payload, diag = safe_fetch_json(config["feed_url"], config["name"])
+        diag["bookmaker"] = config["name"]
+        item = diag
         if payload is None:
-            health.append({
-                "bookmaker": config["name"], "status": "unavailable",
-                "detail": message, "events_loaded": 0,
-            })
-            continue
-        raw_events = payload.get("events")
-        if not isinstance(raw_events, list):
-            health.append({
-                "bookmaker": config["name"], "status": "invalid feed schema",
-                "detail": 'Expected an "events" array', "events_loaded": 0,
-            })
+            health.append(item)
             continue
 
-        loaded = 0
+        raw_events = payload.get("events")
+        if not isinstance(raw_events, list):
+            diag.update(status="invalid schema", schema_valid=False,
+                        detail='Valid JSON, but expected a top-level "events" array')
+            health.append(item)
+            continue
+
+        diag["schema_valid"] = True
+        diag["raw_events"] = len(raw_events)
+        if not raw_events:
+            diag.update(status="no events", detail='Recognized "events" array is empty')
+        rejection_reasons = {}
+        newest_timestamp = None
         for raw in raw_events:
             row = normalize_feed_event(key, raw)
             if row:
                 rows.append(row)
-                loaded += 1
-        health.append({
-            "bookmaker": config["name"],
-            "status": "online" if loaded else "no usable markets",
-            "detail": message,
-            "events_loaded": loaded,
-        })
+                diag["events_loaded"] += 1
+                stamp = parse_timestamp(row.get("updated_at"))
+                if stamp and (newest_timestamp is None or stamp > newest_timestamp):
+                    newest_timestamp = stamp
+            else:
+                diag["events_rejected"] += 1
+                reason = "not an object" if not isinstance(raw, dict) else "missing event/market/outcomes, invalid odds, or not exactly two unique outcomes"
+                rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
+        diag["rejection_reasons"] = rejection_reasons
+        if newest_timestamp:
+            age = max(0, int((datetime.now(timezone.utc) - newest_timestamp).total_seconds()))
+            diag["data_updated_at"] = newest_timestamp.isoformat()
+            diag["freshness_seconds"] = age
+            diag["stale"] = age > STALE_AFTER_SECONDS
+        else:
+            diag["stale"] = None
+
+        if diag["events_loaded"] == 0:
+            diag.update(status="no usable markets", detail="Schema recognized, but no events matched the supported two-outcome market format")
+        elif diag["stale"] is True:
+            diag.update(status="stale data", detail=f"Usable markets found, but newest event timestamp exceeds {STALE_AFTER_SECONDS}s or may be old")
+        elif newest_timestamp is None:
+            diag.update(status="usable markets; freshness unknown", detail="Usable markets found; feed did not provide a parseable updated_at timestamp")
+        else:
+            diag.update(status="usable markets", detail="JSON schema recognized and usable two-outcome markets parsed; source authenticity and odds accuracy are not independently verified")
+        health.append(item)
     return rows, health
 
 
@@ -630,11 +697,13 @@ def run_scan():
             "Unavailable feeds do not count as a negative arbitrage result.",
         ],
     }
-    global LAST_SCAN
+    global LAST_SCAN, LAST_FEED_STATUS
     with STATE_LOCK:
+        LAST_FEED_STATUS = [dict(item) for item in health]
         LAST_SCAN = {
             "at": result["scanned_at"],
-            "feeds_online": sum(1 for item in health if item["status"] == "online"),
+            "feeds_with_usable_markets": sum(1 for item in health if item["events_loaded"] > 0),
+            "configured_feeds": sum(1 for config in BOOKMAKERS.values() if config["feed_url"]),
             "markets": len(rows),
             "opportunities": len(arbitrage),
         }
@@ -971,7 +1040,23 @@ function renderHealth(items) {
   renderList("sourceHealth", items, (item,parent) => {
     const card = el("div", "", parent, "item");
     el("strong", item.bookmaker + " — " + item.status, card);
-    el("p", item.detail + " · usable markets: " + item.events_loaded, card, "small");
+    el("p", item.detail || "No diagnostic detail available.", card, "small");
+    const parts = [
+      "HTTP: " + (item.http_status ?? "not reached"),
+      "Content-Type: " + (item.content_type || "unknown"),
+      "Response: " + (item.response_bytes ?? 0) + " bytes",
+      "Fetch: " + (item.fetch_ms ?? 0) + " ms",
+      "JSON: " + (item.json_valid ? "valid" : "no/invalid"),
+      "Schema: " + (item.schema_valid ? "recognized" : "not confirmed"),
+      "Events: " + (item.raw_events ?? 0) + " received / " + (item.events_loaded ?? 0) + " usable / " + (item.events_rejected ?? 0) + " rejected"
+    ];
+    el("p", parts.join(" · "), card, "small");
+    if (item.last_successful_fetch) el("p", "Last successful JSON fetch: " + item.last_successful_fetch, card, "small");
+    if (item.data_updated_at) el("p", "Newest event timestamp: " + item.data_updated_at + " · age " + item.freshness_seconds + " seconds" + (item.stale ? " · STALE" : ""), card, item.stale ? "warning" : "small");
+    else el("p", "Data freshness: unknown (no usable updated_at timestamp)", card, "small");
+    const reasons = item.rejection_reasons || {};
+    const reasonText = Object.entries(reasons).map(([reason,count]) => reason + ": " + count).join("; ");
+    if (reasonText) el("p", "Rejected-event reasons: " + reasonText, card, "small");
   }, "No source health data.");
 }
 
@@ -1060,7 +1145,7 @@ loadHealth();
 # ---------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SolveEase/3.0"
+    server_version = "SolveEase/3.1"
 
     def log_message(self, fmt, *args):
         # Avoid logging query strings, POST bodies, and booking codes.
@@ -1122,23 +1207,28 @@ class Handler(BaseHTTPRequestHandler):
             with STATE_LOCK:
                 last_scan = dict(LAST_SCAN) if LAST_SCAN else None
                 last_lookup = dict(LAST_LOOKUP) if LAST_LOOKUP else None
+                last_feed_status = [dict(item) for item in LAST_FEED_STATUS] if LAST_FEED_STATUS is not None else None
+            feed_status = last_feed_status if last_feed_status is not None else [
+                {
+                    "bookmaker": config["name"],
+                    "status": "not tested" if config["feed_url"] else "not configured",
+                    "detail": "URL is configured but no scan has tested it in this process" if config["feed_url"] else "No feed URL configured",
+                    "http_status": None, "content_type": None, "response_bytes": 0,
+                    "fetch_ms": 0, "json_valid": False, "schema_valid": False,
+                    "raw_events": 0, "events_loaded": 0, "events_rejected": 0,
+                    "last_successful_fetch": None, "data_updated_at": None,
+                    "freshness_seconds": None, "stale": None,
+                }
+                for config in BOOKMAKERS.values()
+            ]
             self.send_json(200, {
                 "status": "online",
                 "service": "SolveEase Booking & Arbitrage Dashboard",
-                "version": "3.0",
+                "version": "3.1",
                 "configured_feeds": configured,
-                "feed_status": [
-                    {
-                        "bookmaker": config["name"],
-                        "status": "configured" if config["feed_url"] else "not configured",
-                        "detail": (
-                            "Feed URL configured; connection/schema tested during scan"
-                            if config["feed_url"] else "No permitted JSON odds feed configured"
-                        ),
-                        "events_loaded": 0,
-                    }
-                    for config in BOOKMAKERS.values()
-                ],
+                "feed_status": feed_status,
+                "feed_freshness_threshold_seconds": STALE_AFTER_SECONDS,
+                "feed_status_note": "Configured does not mean tested; HTTP success does not prove official source authenticity or accurate live odds.",
                 "ticket_lookup_adapters": {"sportybet": "available", "bet9ja": "not implemented", "betking": "not implemented"},
                 "last_scan": last_scan,
                 "last_lookup": last_lookup,
@@ -1229,7 +1319,7 @@ def main():
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
-    logging.info("SolveEase dashboard v3.0 listening on port %s", PORT)
+    logging.info("SolveEase dashboard v3.1 listening on port %s", PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
