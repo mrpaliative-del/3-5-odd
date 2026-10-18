@@ -96,7 +96,8 @@ def inspect_ticket_data(legs):
     total = len(legs)
     odds_found = sum(
         1 for leg in legs
-        if isinstance(leg.get("odds"), (int, float))
+        if leg.get("odds_verified") is True
+        and isinstance(leg.get("odds"), (int, float))
         and math.isfinite(leg["odds"])
         and leg["odds"] > 1
     )
@@ -125,7 +126,7 @@ def first_value(obj, keys, default=""):
 
 
 def normalize_leg(item, index):
-    """Normalize a SportyBet selection and extract its nested outcome."""
+    """Extract a selection without guessing between possible outcomes."""
 
     event = first_value(
         item,
@@ -140,11 +141,10 @@ def normalize_leg(item, index):
         event = f"{home} vs {away}" if home and away else "Event details unavailable"
 
     markets = item.get("markets", [])
-    chosen_market = None
-    chosen_outcome = None
+    candidates = []
+    explicitly_selected = []
 
     if isinstance(markets, list):
-        # Prefer an active market with an active outcome and valid odds.
         for market in markets:
             if not isinstance(market, dict):
                 continue
@@ -157,56 +157,54 @@ def normalize_leg(item, index):
                 if not isinstance(outcome, dict):
                     continue
 
-                raw_odds = outcome.get("odds")
                 try:
-                    numeric_odds = float(raw_odds)
+                    odds = float(outcome.get("odds"))
                 except (TypeError, ValueError):
                     continue
 
-                if not math.isfinite(numeric_odds) or numeric_odds <= 1:
+                if not math.isfinite(odds) or odds <= 1:
                     continue
 
-                chosen_market = market
-                chosen_outcome = outcome
-                break
+                candidate = (market, outcome, odds)
+                candidates.append(candidate)
 
-            if chosen_outcome is not None:
-                break
+                # Only trust explicit selection markers, not list order.
+                marker = next(
+                    (
+                        outcome[key]
+                        for key in ("isSelected", "selected", "chosen",
+                                    "betSelected")
+                        if key in outcome
+                    ),
+                    None,
+                )
+                if marker is True or marker == 1 or marker == "true":
+                    explicitly_selected.append(candidate)
 
-    # Fall back to direct fields for other response formats.
-    if chosen_outcome is not None:
+    chosen = None
+
+    if len(explicitly_selected) == 1:
+        chosen = explicitly_selected[0]
+    elif len(explicitly_selected) == 0 and len(candidates) == 1:
+        # Safe only when the response provides exactly one valid outcome.
+        chosen = candidates[0]
+
+    if chosen is not None:
+        market, outcome, odds = chosen
         market_name = first_value(
-            chosen_market, ("desc", "marketName", "marketDesc", "name"),
+            market, ("desc", "marketName", "marketDesc", "name"),
             "Market unavailable",
         )
         selection_name = first_value(
-            chosen_outcome,
-            ("desc", "outcomeName", "selectionName", "name"),
+            outcome, ("desc", "outcomeName", "selectionName", "name"),
             "Selection details unavailable",
         )
-        odds = float(chosen_outcome["odds"])
+        odds_verified = True
     else:
-        market_name = first_value(
-            item, ("marketName", "market_name", "marketDesc", "market"),
-            "Market unavailable",
-        )
-        selection_name = first_value(
-            item,
-            ("outcomeName", "outcome_name", "selectionName",
-             "optionName", "runnerName", "pick", "selection", "name"),
-            "Selection details unavailable",
-        )
-
-        odds_raw = first_value(
-            item, ("odds", "odd", "decimalOdds", "price",
-                   "oddsValue", "currentOdds"), None,
-        )
-        try:
-            odds = float(odds_raw)
-            if not math.isfinite(odds) or odds <= 1:
-                odds = None
-        except (TypeError, ValueError):
-            odds = None
+        market_name = "Selection market needs verification"
+        selection_name = "Selected outcome not identifiable"
+        odds = None
+        odds_verified = False
 
     kickoff = first_value(
         item,
@@ -221,6 +219,7 @@ def normalize_leg(item, index):
         "market": str(market_name),
         "selection": str(selection_name),
         "odds": odds,
+        "odds_verified": odds_verified,
         "kickoff": kickoff,
     }
 
@@ -416,15 +415,18 @@ def lookup_sportybet(booking_code):
 
     known_odds = [
         leg["odds"] for leg in legs
-        if isinstance(leg["odds"], (int, float))
+        if leg.get("odds_verified") is True
+        and isinstance(leg.get("odds"), (int, float))
     ]
 
-    combined_odds = None
+    combined_odds = (
+        math.prod(known_odds)
+        if len(known_odds) == len(legs) and legs
+        else None
+    )
 
-    if len(known_odds) == len(legs):
-        combined_odds = math.prod(known_odds)
-
-    ticket_fields = find_text_fields(payload)
+    # Do not mislabel event-level fields as ticket-level values.
+    ticket_fields = {}
 
     result = {
         "ok": True,
