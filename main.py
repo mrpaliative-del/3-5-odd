@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 SolveEase SportyBet Booking-Code Dashboard
@@ -27,7 +26,7 @@ import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -298,7 +297,6 @@ def lookup_sportybet(booking_code):
             "error": "SportyBet returned an unexpected response.",
         }
 
-    # Some API responses include an application-level status code.
     if isinstance(payload, dict):
         biz_code = payload.get("bizCode")
 
@@ -348,7 +346,6 @@ def lookup_sportybet(booking_code):
 
     combined_odds = None
 
-    # Do not calculate combined odds if any selection odds are missing.
     if len(known_odds) == len(legs):
         combined_odds = math.prod(known_odds)
 
@@ -766,8 +763,9 @@ class SolveEaseHandler(BaseHTTPRequestHandler):
             raise ValueError("Request body must be valid JSON.")
 
     def do_HEAD(self):
-        if self.path in ("/", "/health", "/state"):
-            if self.path == "/":
+        path = urlsplit(self.path).path.rstrip("/") or "/"
+        if path in ("/", "/health", "/state"):
+            if path == "/":
                 body = HTML.encode("utf-8")
                 self.send_bytes(
                     200, body, "text/html; charset=utf-8"
@@ -778,7 +776,9 @@ class SolveEaseHandler(BaseHTTPRequestHandler):
             self.send_json(404, {"ok": False, "error": "Not found."})
 
     def do_GET(self):
-        if self.path == "/":
+        path = urlsplit(self.path).path.rstrip("/") or "/"
+
+        if path == "/":
             self.send_bytes(
                 200,
                 HTML.encode("utf-8"),
@@ -786,13 +786,25 @@ class SolveEaseHandler(BaseHTTPRequestHandler):
             )
             return
 
-        if self.path == "/favicon.ico":
+        if path == "/favicon.ico":
             self.send_response(204)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
 
-        if self.path == "/health":
+        if path == "/api/analyse":
+            self.send_json(405, {
+                "ok": False,
+                "error": (
+                    "This endpoint requires POST. Open the dashboard, "
+                    "enter a booking code, and tap Look up ticket."
+                ),
+                "expected_method": "POST",
+                "expected_path": "/api/analyse",
+            })
+            return
+
+        if path == "/health":
             with LAST_LOOKUP_LOCK:
                 last_lookup = LAST_LOOKUP
 
@@ -807,7 +819,7 @@ class SolveEaseHandler(BaseHTTPRequestHandler):
             })
             return
 
-        if self.path == "/state":
+        if path == "/state":
             with LAST_LOOKUP_LOCK:
                 last_lookup = LAST_LOOKUP
 
@@ -817,9 +829,13 @@ class SolveEaseHandler(BaseHTTPRequestHandler):
             })
             return
 
+        logging.warning("Unmatched GET route: %s", self.path)
+
         self.send_json(404, {
             "ok": False,
             "error": "Route not found.",
+            "requested_path": path,
+            "hint": "Open the dashboard homepage.",
         })
 
     def do_POST(self):
@@ -879,7 +895,6 @@ class SolveEaseHandler(BaseHTTPRequestHandler):
             })
             return
 
-        # Reject control characters; otherwise allow provider code formats.
         if re.search(r"[\x00-\x1f\x7f]", booking_code):
             self.send_json(400, {
                 "ok": False,
