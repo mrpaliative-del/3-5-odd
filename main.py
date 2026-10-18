@@ -125,66 +125,101 @@ def first_value(obj, keys, default=""):
 
 
 def normalize_leg(item, index):
-    """Normalize common selection fields without inventing missing data."""
+    """Normalize a SportyBet selection and extract its nested outcome."""
 
     event = first_value(
         item,
-        (
-            "eventName", "event_name", "matchName", "match",
-            "fixtureName", "event", "homeAwayName",
-        ),
-        "Event details unavailable",
+        ("eventName", "event_name", "matchName", "match",
+         "fixtureName", "homeAwayName"),
+        "",
     )
 
-    market = first_value(
-        item,
-        (
-            "marketName", "market_name", "marketDesc",
-            "market", "betType", "playTypeName",
-        ),
-        "Market unavailable",
-    )
+    if not event:
+        home = first_value(item, ("homeTeamName",), "")
+        away = first_value(item, ("awayTeamName",), "")
+        event = f"{home} vs {away}" if home and away else "Event details unavailable"
 
-    selection = first_value(
-        item,
-        (
-            "outcomeName", "outcome_name", "selectionName",
-            "optionName", "runnerName", "pick", "selection",
-            "name",
-        ),
-        "Selection details unavailable",
-    )
+    markets = item.get("markets", [])
+    chosen_market = None
+    chosen_outcome = None
 
-    odds_raw = first_value(
-        item,
-        (
-            "odds", "odd", "decimalOdds", "price",
-            "oddsValue", "currentOdds",
-        ),
-        None,
-    )
+    if isinstance(markets, list):
+        # Prefer an active market with an active outcome and valid odds.
+        for market in markets:
+            if not isinstance(market, dict):
+                continue
 
-    try:
-        odds = float(odds_raw)
-        if not math.isfinite(odds) or odds <= 1:
+            outcomes = market.get("outcomes", [])
+            if not isinstance(outcomes, list):
+                continue
+
+            for outcome in outcomes:
+                if not isinstance(outcome, dict):
+                    continue
+
+                raw_odds = outcome.get("odds")
+                try:
+                    numeric_odds = float(raw_odds)
+                except (TypeError, ValueError):
+                    continue
+
+                if not math.isfinite(numeric_odds) or numeric_odds <= 1:
+                    continue
+
+                chosen_market = market
+                chosen_outcome = outcome
+                break
+
+            if chosen_outcome is not None:
+                break
+
+    # Fall back to direct fields for other response formats.
+    if chosen_outcome is not None:
+        market_name = first_value(
+            chosen_market, ("desc", "marketName", "marketDesc", "name"),
+            "Market unavailable",
+        )
+        selection_name = first_value(
+            chosen_outcome,
+            ("desc", "outcomeName", "selectionName", "name"),
+            "Selection details unavailable",
+        )
+        odds = float(chosen_outcome["odds"])
+    else:
+        market_name = first_value(
+            item, ("marketName", "market_name", "marketDesc", "market"),
+            "Market unavailable",
+        )
+        selection_name = first_value(
+            item,
+            ("outcomeName", "outcome_name", "selectionName",
+             "optionName", "runnerName", "pick", "selection", "name"),
+            "Selection details unavailable",
+        )
+
+        odds_raw = first_value(
+            item, ("odds", "odd", "decimalOdds", "price",
+                   "oddsValue", "currentOdds"), None,
+        )
+        try:
+            odds = float(odds_raw)
+            if not math.isfinite(odds) or odds <= 1:
+                odds = None
+        except (TypeError, ValueError):
             odds = None
-    except (TypeError, ValueError):
-        odds = None
 
     kickoff = first_value(
         item,
-        (
-            "matchTime", "startTime", "eventTime",
-            "kickoff", "beginTime",
-        ),
+        ("estimateStartTime", "matchTime", "startTime",
+         "eventTime", "kickoff", "beginTime"),
         "",
     )
 
     return {
         "number": index + 1,
         "event": str(event),
-        "market": str(market),
-        "selection": str(selection),
+        "market": str(market_name),
+        "selection": str(selection_name),
         "odds": odds,
         "kickoff": kickoff,
     }
