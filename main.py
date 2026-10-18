@@ -270,9 +270,44 @@ def find_text_fields(payload):
     return result
 
 
+def parse_positive_number(value):
+    """Parse a finite positive number, including formatted numeric strings."""
+    if isinstance(value, bool) or value is None:
+        return None
+
+    try:
+        if isinstance(value, str):
+            value = value.strip().replace(",", "")
+            if not value:
+                return None
+
+        number = float(value)
+
+        if math.isfinite(number) and number > 1:
+            return number
+
+    except (TypeError, ValueError, OverflowError):
+        pass
+
+    return None
+
+
+def safe_ticket_value(value):
+    """Keep source-provided scalar values; do not guess object formats."""
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, (str, int)):
+        return value
+
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+
+    return None
+
+
 def lookup_sportybet(booking_code):
     """Fetch a shared booking code from SportyBet's unofficial endpoint."""
-
     url = SPORTYBET_URL + quote(booking_code, safe="")
 
     request = Request(
@@ -298,17 +333,14 @@ def lookup_sportybet(booking_code):
 
     except HTTPError as exc:
         logging.warning("SportyBet returned HTTP %s", exc.code)
-
         if exc.code in (401, 403, 429):
             return {
                 "ok": False,
                 "error": (
                     "SportyBet rejected or rate-limited the request. "
-                    "Try again later or load the code on SportyBet's "
-                    "official website."
+                    "Try again later or use SportyBet's official website."
                 ),
             }
-
         return {
             "ok": False,
             "error": f"SportyBet returned HTTP {exc.code}.",
@@ -316,7 +348,6 @@ def lookup_sportybet(booking_code):
 
     except (URLError, TimeoutError, OSError) as exc:
         logging.warning("SportyBet request failed: %s", exc)
-
         return {
             "ok": False,
             "error": (
@@ -339,141 +370,82 @@ def lookup_sportybet(booking_code):
             "ok": False,
             "error": (
                 "SportyBet did not return JSON. Its endpoint may have "
-                "changed or may require additional access."
+                "changed or restricted access."
             ),
         }
 
-    if isinstance(payload, dict):
-        logging.info("RESPONSE TOP-LEVEL KEYS: %s", list(payload.keys()))
-        logging.info(
-            "RESPONSE TOP-LEVEL SCALAR FIELDS: %s",
-            {
-                k: v for k, v in payload.items()
-                if not isinstance(v, (dict, list))
-                and k.lower() not in {
-                    "sharecode", "bookingcode", "ordercode"
-                }
-            }
-        )
-
-        data = payload.get("data")
-
-        logging.info("DATA TYPE: %s", type(data).__name__)
-
-        if isinstance(data, dict):
-            logging.info("DATA KEYS: %s", list(data.keys()))
-
-            data_dict = payload.get("data", {})
-            ticket = data_dict.get("ticket", {}) if isinstance(data_dict, dict) else {}
-
-            if isinstance(ticket, dict):
-                logging.info("TICKET SUMMARY VALUES: %s", {
-                    key: ticket.get(key)
-                    for key in (
-                        "orderType",
-                        "selections",
-                        "potentialWinnings",
-                        "totalStake",
-                        "displayTotalOdds",
-                        "displayBonus",
-                    )
-                })
-
-                for key in ("selections", "bets"):
-                    value = ticket.get(key)
-                    if isinstance(value, dict):
-                        logging.info("TICKET %s KEYS: %s", key, list(value.keys()))
-                    elif isinstance(value, list):
-                        logging.info(
-                            "TICKET %s: list length=%s",
-                            key, len(value)
-                        )
-                    else:
-                        logging.info(
-                            "TICKET %s TYPE: %s",
-                            key, type(value).__name__
-                        )
-
-            logging.info("SOURCE BET TYPE: %s", data_dict.get("betType"))
-
-            for key, value in data.items():
-                if isinstance(value, dict):
-                    logging.info(
-                        "DATA NESTED OBJECT %s KEYS: %s",
-                        key, list(value.keys())
-                    )
-                elif isinstance(value, list):
-                    first_keys = (
-                        list(value[0].keys())
-                        if value and isinstance(value[0], dict)
-                        else []
-                    )
-                    logging.info(
-                        "DATA LIST %s: length=%s first_item_keys=%s",
-                        key, len(value), first_keys
-                    )
-
-        elif isinstance(data, list):
-            first_keys = (
-                list(data[0].keys())
-                if data and isinstance(data[0], dict)
-                else []
-            )
-            logging.info(
-                "DATA LIST: length=%s first_item_keys=%s",
-                len(data), first_keys
-            )
-
-    if not isinstance(payload, (dict, list)):
+    if not isinstance(payload, dict):
         return {
             "ok": False,
             "error": "SportyBet returned an unexpected response.",
         }
 
-    if isinstance(payload, dict):
-        biz_code = payload.get("bizCode")
-
-        if biz_code is not None and str(biz_code) != "10000":
-            message = first_value(
-                payload,
-                ("message", "msg", "errorMsg", "error"),
-                "SportyBet did not accept this booking code.",
-            )
-            return {
-                "ok": False,
-                "error": str(message),
+    logging.info("RESPONSE TOP-LEVEL KEYS: %s", list(payload.keys()))
+    logging.info(
+        "RESPONSE TOP-LEVEL SCALAR FIELDS: %s",
+        {
+            key: value
+            for key, value in payload.items()
+            if not isinstance(value, (dict, list))
+            and key.lower() not in {
+                "sharecode", "bookingcode", "ordercode"
             }
+        },
+    )
 
-    raw_legs = find_outcomes(payload)
-
-    if raw_legs:
-        logging.info(
-            "FIRST SELECTION FIELD NAMES: %s",
-            list(raw_legs[0].keys())
-            if isinstance(raw_legs[0], dict)
-            else type(raw_legs[0]).__name__,
+    biz_code = payload.get("bizCode")
+    if biz_code is not None and str(biz_code) != "10000":
+        message = first_value(
+            payload,
+            ("message", "msg", "errorMsg", "error"),
+            "SportyBet did not accept this booking code.",
         )
+        return {"ok": False, "error": str(message)}
 
-        logging.info(
-            "FIRST SELECTION SAMPLE: %s",
-            json.dumps(raw_legs[0], ensure_ascii=False)[:2500]
-            if isinstance(raw_legs[0], dict)
-            else str(raw_legs[0])[:500],
-        )
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        data = {}
+
+    ticket = data.get("ticket")
+    if not isinstance(ticket, dict):
+        ticket = {}
+
+    logging.info("DATA KEYS: %s", list(data.keys()))
+    logging.info(
+        "TICKET SUMMARY VALUES: %s",
+        {
+            key: ticket.get(key)
+            for key in (
+                "orderType",
+                "potentialWinnings",
+                "totalStake",
+                "displayTotalOdds",
+                "displayBonus",
+            )
+        },
+    )
+
+    # Use the endpoint's explicit selection list when available.
+    # Fall back to recursive discovery only if it is absent or empty.
+    raw_legs = data.get("outcomes")
+    if not isinstance(raw_legs, list) or not raw_legs:
+        raw_legs = find_outcomes(payload)
 
     if not raw_legs:
-        logging.info(
-            "SportyBet response contained no recognizable selections"
-        )
+        logging.info("No recognizable selections were returned")
         return {
             "ok": False,
             "error": (
                 "No recognizable ticket selections were returned. "
-                "The booking code may be invalid, expired, private, "
-                "or the SportyBet response format may have changed."
+                "The code may be invalid or the source response changed."
             ),
             "source_status": status_code,
         }
+
+    logging.info(
+        "SOURCE SELECTION COUNT: %s",
+        len(raw_legs),
+    )
 
     legs = [
         normalize_leg(item, index)
@@ -488,27 +460,54 @@ def lookup_sportybet(booking_code):
         }
 
     diagnostics = inspect_ticket_data(legs)
-
     logging.info(
         "Ticket data quality: %s",
         json.dumps(diagnostics),
     )
 
+    # Prefer SportyBet's ticket-level combined odds.
+    # Fall back to multiplying verified selection odds.
+    source_combined_odds = parse_positive_number(
+        ticket.get("displayTotalOdds")
+    )
+
     known_odds = [
-        leg["odds"] for leg in legs
+        leg["odds"]
+        for leg in legs
         if leg.get("odds_verified") is True
         and isinstance(leg.get("odds"), (int, float))
+        and math.isfinite(leg["odds"])
+        and leg["odds"] > 1
     ]
 
-    combined_odds = (
+    calculated_odds = (
         math.prod(known_odds)
-        if len(known_odds) == len(legs) and legs
+        if legs and len(known_odds) == len(legs)
         else None
     )
 
-    # Do not mislabel event-level fields as ticket-level values.
-    ticket_fields = {}
+    combined_odds = (
+        source_combined_odds
+        if source_combined_odds is not None
+        else calculated_odds
+    )
 
+    # These are ticket-level fields, not individual event fields.
+    stake = safe_ticket_value(ticket.get("totalStake"))
+    potential_return = safe_ticket_value(
+        ticket.get("potentialWinnings")
+    )
+
+    # Only report an overall status if the ticket object actually
+    # supplies one. Never use a match's status or bookingStatus.
+    status = first_value(
+        ticket,
+        ("status", "orderStatus", "betStatus", "state"),
+        "Not provided",
+    )
+
+    # Currency is retained as NGN for this Nigeria-specific endpoint.
+    # Amounts are not converted because their units have not been verified.
     result = {
         "ok": True,
         "booking_code": booking_code,
@@ -516,15 +515,16 @@ def lookup_sportybet(booking_code):
         "legs": legs,
         "combined_odds": combined_odds,
         "diagnostics": diagnostics,
-        "status": ticket_fields.get("status", "Not provided"),
-        "stake": ticket_fields.get("stake"),
-        "potential_return": ticket_fields.get("potential_return"),
-        "currency": ticket_fields.get("currency", "NGN"),
+        "status": status,
+        "stake": stake,
+        "potential_return": potential_return,
+        "currency": "NGN",
         "retrieved_at": datetime.now(timezone.utc).isoformat(),
         "source": "SportyBet unofficial share endpoint",
         "note": (
-            "Ticket information returned by the source is shown "
-            "without inventing missing odds or probabilities."
+            "Ticket details are sourced from SportyBet's response. "
+            "Verify the stake, potential return, odds and selections "
+            "on SportyBet before making any decision."
         ),
     }
 
@@ -539,6 +539,15 @@ def lookup_sportybet(booking_code):
     logging.info(
         "Booking lookup returned %s selections",
         len(legs),
+    )
+    logging.info(
+        "SUMMARY FIELD AVAILABILITY: %s",
+        {
+            "source_combined_odds_available": source_combined_odds is not None,
+            "stake_available": stake is not None,
+            "potential_return_available": potential_return is not None,
+            "overall_status_available": status != "Not provided",
+        },
     )
 
     return result
