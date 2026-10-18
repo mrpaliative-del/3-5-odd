@@ -331,6 +331,21 @@ def lookup_sportybet(booking_code):
 
     raw_legs = find_outcomes(payload)
 
+    if raw_legs:
+        logging.info(
+            "FIRST SELECTION FIELD NAMES: %s",
+            list(raw_legs[0].keys())
+            if isinstance(raw_legs[0], dict)
+            else type(raw_legs[0]).__name__,
+        )
+
+        logging.info(
+            "FIRST SELECTION SAMPLE: %s",
+            json.dumps(raw_legs[0], ensure_ascii=False)[:2500]
+            if isinstance(raw_legs[0], dict)
+            else str(raw_legs[0])[:500],
+        )
+
     if not raw_legs:
         logging.info(
             "SportyBet response contained no recognizable selections"
