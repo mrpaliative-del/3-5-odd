@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/init/env python3
 """
 SolveEase SportyBet Booking-Code Dashboard
 Python standard library only.
@@ -342,6 +342,19 @@ def lookup_sportybet(booking_code):
                 "changed or may require additional access."
             ),
         }
+
+    if isinstance(payload, dict):
+        logging.info("RESPONSE TOP-LEVEL KEYS: %s", list(payload.keys()))
+        logging.info(
+            "RESPONSE TOP-LEVEL SCALAR FIELDS: %s",
+            {
+                k: v for k, v in payload.items()
+                if not isinstance(v, (dict, list))
+                and k.lower() not in {
+                    "sharecode", "bookingcode", "ordercode"
+                }
+            }
+        )
 
     if not isinstance(payload, (dict, list)):
         return {
