@@ -61,10 +61,11 @@ import re
 import threading
 import time
 import unicodedata
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 HOST = "0.0.0.0"
@@ -443,39 +444,57 @@ def lookup_sportybet(code):
 # ---------------------------------------------------------------------
 
 def prepare_feed_request(bookmaker_key, configured_url):
-    """Resolve known website-homepage settings to the documented data candidate."""
-    if bookmaker_key != "sportybet" or not configured_url:
-        return configured_url, {}
+    """Resolve homepage URLs to source-specific public data candidates.
 
+    These are candidates, not guarantees: the bookmaker can change or restrict them.
+    """
+    if not configured_url:
+        return configured_url, {}
     try:
         parsed = urlsplit(configured_url)
     except ValueError:
         return configured_url, {}
     host = (parsed.hostname or "").lower()
     path = parsed.path.rstrip("/").lower()
-    is_sportybet_site = host == "sportybet.com" or host.endswith(".sportybet.com")
-    # The user configured the public homepage/mobile page, not a data endpoint.
-    if is_sportybet_site and "/api/" not in path:
-        params = {
-            "sportId": "sr:sport:1",
-            "marketId": "1,18,10,29,11,26,36,14,60100",
-            "pageSize": "100",
-            "pageNum": "1",
-            "todayGames": "false",
-            "_t": str(int(time.time() * 1000)),
-        }
-        from urllib.parse import urlencode
-        url = "https://www.sportybet.com/api/ng/factsCenter/pcUpcomingEvents?" + urlencode(params)
-        return url, {
-            "Accept": "application/json, text/plain, */*",
-            "Current-Country": "NG",
-            "Origin": "https://www.sportybet.com",
-            "Referer": "https://www.sportybet.com/ng/",
-        }
-    return configured_url, {
-        "Current-Country": "NG",
-        "Referer": "https://www.sportybet.com/ng/",
-    }
+
+    if bookmaker_key == "sportybet":
+        is_site = host == "sportybet.com" or host.endswith(".sportybet.com")
+        if is_site and "/api/" not in path:
+            params = {
+                "sportId": "sr:sport:1",
+                "marketId": "1,18,10,29,11,26,36,14,60100",
+                "pageSize": "100", "pageNum": "1", "todayGames": "false",
+                "_t": str(int(time.time() * 1000)),
+            }
+            url = "https://www.sportybet.com/api/ng/factsCenter/pcUpcomingEvents?" + urlencode(params)
+            return url, {
+                "Accept": "application/json, text/plain, */*", "Current-Country": "NG",
+                "Origin": "https://www.sportybet.com", "Referer": "https://www.sportybet.com/ng/",
+            }
+        return configured_url, {"Current-Country": "NG", "Referer": "https://www.sportybet.com/ng/"}
+
+    if bookmaker_key == "bet9ja":
+        # The configured /Sport/Odds page is HTML. Use the documented MarketWS XML operation.
+        if host in ("web.bet9ja.com", "www.bet9ja.com") and ("marketws.asmx" in path or path == "/sport/odds" or path == ""):
+            return "https://web.bet9ja.com/Controls/MarketWS.asmx", {"Referer": "https://web.bet9ja.com/Sport/Odds", "Accept": "text/xml, application/xml, */*"}
+        if host.endswith("bet9ja.com") and "/controls/marketws.asmx" in path:
+            return configured_url, {"Referer": "https://web.bet9ja.com/Sport/Odds", "Accept": "text/xml, application/xml, */*"}
+
+    if bookmaker_key == "1xbet":
+        # Public LineFeed endpoint candidate for football fixtures. The adapter only accepts
+        # actual market/outcome odds fields; fixture names alone are never treated as odds.
+        if host == "1xbet.ng" or host.endswith(".1xbet.ng"):
+            if "/linefeed/" not in path:
+                params = {"sports": "1", "count": "1000", "lng": "en", "mode": "4", "country": "1"}
+                return "https://1xbet.ng/LineFeed/BestGamesExtZip?" + urlencode(params), {"Accept": "application/json, text/plain, */*", "Referer": "https://1xbet.ng/en"}
+
+    if bookmaker_key == "betway":
+        # Candidate endpoint documented for Betway's South African site. Nigeria host is
+        # deliberately retained; it may 404 if that regional site uses another backend.
+        if host == "betway.com.ng" or host.endswith(".betway.com.ng"):
+            if "/sportsapi/" not in path:
+                return "https://www.betway.com.ng/sportsapi/br/v1/BetBook/Highlights/", {"Accept": "application/json, text/plain, */*", "Referer": "https://www.betway.com.ng/"}
+    return configured_url, {}
 
 
 def adapt_sportybet_payload(payload):
@@ -602,11 +621,265 @@ def normalize_feed_event(bookmaker_key, raw):
     }
 
 
+def safe_fetch_xml(url, label, extra_headers=None):
+    """Fetch public XML without attempting to bypass access controls."""
+    started = time.monotonic()
+    diag = {
+        "http_status": None, "content_type": None, "response_bytes": 0,
+        "fetch_ms": 0, "json_valid": False, "xml_valid": False, "schema_valid": False,
+        "raw_events": 0, "events_loaded": 0, "events_rejected": 0,
+        "rejection_reasons": {}, "last_successful_fetch": None,
+        "data_updated_at": None, "freshness_seconds": None, "stale": None,
+        "detail": "", "status": "not configured",
+    }
+    if not url:
+        diag["detail"] = "No feed URL configured"
+        return None, diag
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; SolveEaseFeedMonitor/3.3)", "Accept": "text/xml, application/xml, */*"}
+    if extra_headers:
+        headers.update(extra_headers)
+    request = Request(url, headers=headers, method="GET")
+    try:
+        with urlopen(request, timeout=TIMEOUT) as response:
+            diag["http_status"] = int(response.status)
+            diag["content_type"] = response.headers.get("Content-Type", "")[:160]
+            body = response.read(MAX_FEED_BYTES + 1)
+            diag["response_bytes"] = len(body)
+            if len(body) > MAX_FEED_BYTES:
+                diag.update(status="response too large", detail=f"XML response exceeded {MAX_FEED_BYTES} byte limit")
+                return None, diag
+            if not 200 <= response.status < 300:
+                diag.update(status="http error", detail=f"HTTP {response.status}")
+                return None, diag
+    except HTTPError as exc:
+        diag["http_status"] = int(exc.code)
+        diag["content_type"] = exc.headers.get("Content-Type", "")[:160] if exc.headers else ""
+        diag.update(status="http error", detail=f"HTTP {exc.code}")
+        return None, diag
+    except (URLError, TimeoutError, OSError) as exc:
+        diag.update(status="fetch failed", detail=f"Network request failed ({type(exc).__name__})")
+        return None, diag
+    finally:
+        diag["fetch_ms"] = round((time.monotonic() - started) * 1000)
+    try:
+        root = ET.fromstring(body)
+        diag["xml_valid"] = True
+        diag["last_successful_fetch"] = now_iso()
+        diag["status"] = "XML received"
+        return root, diag
+    except ET.ParseError:
+        diag.update(status="invalid response", detail="Response is not parseable XML; endpoint may return HTML or an access page")
+        return None, diag
+
+
+def _xml_local(tag):
+    return tag.rsplit("}", 1)[-1].split(":")[-1].lower()
+
+
+def _xml_child_text(node, names):
+    wanted = {n.lower() for n in names}
+    for child in list(node):
+        if _xml_local(child.tag) in wanted and child.text and child.text.strip():
+            return child.text.strip()
+    return ""
+
+
+def fetch_bet9ja_xml(configured_url, headers):
+    """Probe Bet9ja's documented XML service, discover football sport ID, then request odds.
+
+    This uses the published service interface only. It does not evade a 403/WAF response.
+    """
+    base = "https://web.bet9ja.com/Controls/MarketWS.asmx"
+    params = {"strQuotaMax": "1000", "tipoVisQuote": "0"}
+    sport_url = base + "/GetListSport_OddLessThan?" + urlencode(params)
+    root, diag = safe_fetch_xml(sport_url, "Bet9ja sports list", headers)
+    if root is None:
+        diag["bookmaker"] = "Bet9ja"
+        return [], diag
+    sport_id = None
+    for node in root.iter():
+        if _xml_local(node.tag) != "clssportlist":
+            continue
+        name = _xml_child_text(node, ["Sport"])
+        ident = _xml_child_text(node, ["IDSport"])
+        if name and ident and any(word in name.lower() for word in ("football", "soccer", "calcio")):
+            sport_id = ident
+            break
+    if not sport_id:
+        diag.update(status="invalid schema", schema_valid=False, detail="Bet9ja XML parsed, but no football sport ID was identified in the published service response")
+        diag["bookmaker"] = "Bet9ja"
+        return [], diag
+    odds_params = {"strQuotaMax": "1000", "strIDSport": sport_id, "typeOrder": "0", "tipoVisQuote": "0"}
+    odds_url = base + "/GetListOdds_OddLessThan?" + urlencode(odds_params)
+    odds_root, odds_diag = safe_fetch_xml(odds_url, "Bet9ja odds", headers)
+    # Prefer the odds response diagnostics; include both request durations and sizes.
+    odds_diag["fetch_ms"] += diag.get("fetch_ms", 0)
+    odds_diag["response_bytes"] += diag.get("response_bytes", 0)
+    odds_diag["bookmaker"] = "Bet9ja"
+    if odds_root is None:
+        odds_diag["detail"] = "Football sport ID discovered, but the Bet9ja odds operation failed: " + odds_diag.get("detail", "unknown error")
+        return [], odds_diag
+
+    odds_diag["schema_valid"] = True
+    odds_diag["status"] = "XML schema recognized; checking quote fields"
+    odds_diag["last_successful_fetch"] = odds_diag.get("last_successful_fetch") or now_iso()
+    normalized = []
+    # The published service exposes SubEvents, OddClass and Quote/clsQuoteList.
+    # Parse conservatively: only emit a market when two named selections have numeric decimal odds.
+    for subevent in odds_root.iter():
+        if _xml_local(subevent.tag) != "clssubeventslist":
+            continue
+        event_name = _xml_child_text(subevent, ["Evento", "Event", "EventName"])
+        subevent_name = _xml_child_text(subevent, ["SottoEvento", "SubEvent", "Market"])
+        quote_parent = next((c for c in list(subevent) if _xml_local(c.tag) == "quote"), None)
+        if not event_name or quote_parent is None:
+            continue
+        selections = []
+        for quote_node in quote_parent.iter():
+            if quote_node is quote_parent or not list(quote_node):
+                continue
+            fields = {_xml_local(c.tag): (c.text or "").strip() for c in list(quote_node)}
+            odds = None
+            for key, value in fields.items():
+                if any(term in key for term in ("quota", "odd", "price", "value")):
+                    odds = finite_number(value, minimum=1.000001)
+                    if odds is not None:
+                        break
+            label = ""
+            for key, value in fields.items():
+                if value and any(term in key for term in ("name", "desc", "esito", "selection", "segno", "tipo")):
+                    label = value
+                    break
+            if odds is not None and label:
+                selections.append({"name": label, "odds": odds})
+        # Keep unique labels only; skip unclear or 3-way markets.
+        unique = {normalize_text(o["name"]): o for o in selections if normalize_text(o["name"])}
+        if len(unique) == 2:
+            normalized.append({"sport": "Football", "event": event_name, "market": subevent_name or "Bet9ja market", "outcomes": list(unique.values()), "updated_at": None})
+    odds_diag["raw_events"] = sum(1 for n in odds_root.iter() if _xml_local(n.tag) == "clssubeventslist")
+    odds_diag["events_loaded"] = len(normalized)
+    odds_diag["events_rejected"] = max(0, odds_diag["raw_events"] - len(normalized))
+    if normalized:
+        odds_diag.update(status="usable markets; freshness unknown", detail="Bet9ja XML returned named two-outcome markets; update timestamps were not confirmed")
+    elif odds_diag["raw_events"]:
+        odds_diag.update(status="no usable markets", detail="Bet9ja XML parsed, but quote field names/values did not yield exactly two named decimal-odds outcomes; adapter needs a sample response to map safely")
+    else:
+        odds_diag.update(status="no events", detail="Bet9ja XML schema parsed, but no subevents were returned")
+    return normalized, odds_diag
+
+
+def adapt_betway_payload(payload):
+    """Normalize Betway's documented flat event/market/outcome/price arrays when present."""
+    if not isinstance(payload, dict):
+        return None, 0, "Betway JSON root is not an object"
+    def arr(*names):
+        for name in names:
+            value = payload.get(name)
+            if isinstance(value, list):
+                return value
+        return []
+    events = arr("events", "Events", "eventList", "EventList")
+    markets = arr("markets", "Markets", "marketList", "MarketList")
+    outcomes = arr("outcomes", "Outcomes", "selections", "Selections")
+    prices = arr("prices", "Prices", "odds", "Odds")
+    if not events or not markets or not outcomes:
+        return None, len(events), "Valid JSON, but expected Betway flat arrays (events, markets, outcomes, prices) were not all present"
+    def pick(obj, *keys):
+        return first_value(obj, keys)
+    event_by_id = {}
+    for e in events:
+        eid = pick(e, "id", "eventId", "EventId", "eventID", "ID")
+        home = pick(e, "home", "homeName", "Home", "HomeName", "participant1")
+        away = pick(e, "away", "awayName", "Away", "AwayName", "participant2")
+        name = pick(e, "name", "eventName", "EventName", "caption", "Caption")
+        if not name and home and away:
+            name = f"{home} vs {away}"
+        if eid is not None and name:
+            event_by_id[str(eid)] = str(name)
+    outcomes_by_market = {}
+    price_by_outcome = {}
+    for price in prices:
+        oid = pick(price, "outcomeId", "OutcomeId", "selectionId", "SelectionId", "id", "Id")
+        val = pick(price, "odds", "price", "value", "decimalOdds", "DecimalOdds", "Odd")
+        if oid is not None and finite_number(val, minimum=1.000001) is not None:
+            price_by_outcome[str(oid)] = finite_number(val, minimum=1.000001)
+    for o in outcomes:
+        oid = pick(o, "id", "outcomeId", "OutcomeId", "selectionId", "SelectionId", "ID")
+        mid = pick(o, "marketId", "MarketId", "marketID", "parentMarketId")
+        name = pick(o, "name", "outcomeName", "OutcomeName", "caption", "Caption", "description", "Description")
+        odd = finite_number(pick(o, "odds", "price", "value", "decimalOdds", "DecimalOdds", "Odd"), minimum=1.000001)
+        if odd is None and oid is not None:
+            odd = price_by_outcome.get(str(oid))
+        if mid is not None and name and odd is not None:
+            outcomes_by_market.setdefault(str(mid), []).append({"name": str(name), "odds": odd})
+    normalized = []
+    for market in markets:
+        mid = pick(market, "id", "marketId", "MarketId", "marketID", "ID")
+        eid = pick(market, "eventId", "EventId", "eventID", "parentEventId")
+        event_name = event_by_id.get(str(eid))
+        market_name = pick(market, "name", "marketName", "MarketName", "caption", "Caption", "description", "Description")
+        vals = outcomes_by_market.get(str(mid), [])
+        if event_name and market_name and len({normalize_text(x["name"]) for x in vals}) == 2:
+            normalized.append({"sport": "Football", "event": event_name, "market": str(market_name), "outcomes": vals, "updated_at": pick(market, "updatedAt", "updated_at", "lastUpdate")})
+    return normalized, len(events), "Betway flat-array schema recognized"
+
+
+def adapt_1xbet_payload(payload):
+    """Recognize 1xBet LineFeed fixture payloads without inventing unsupported odds."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("Value"), list):
+        return None, 0, 'Valid JSON, but expected 1xBet LineFeed "Value" array'
+    events = payload.get("Value", [])
+    normalized = []
+    for item in events:
+        if not isinstance(item, dict):
+            continue
+        # Only accept explicit market/outcome collections; fixture-level labels are not prices.
+        markets = item.get("markets") or item.get("Markets") or item.get("E")
+        if not isinstance(markets, list):
+            continue
+        home = first_value(item, ["O1", "home", "homeTeam", "HomeTeam"])
+        away = first_value(item, ["O2", "away", "awayTeam", "AwayTeam"])
+        if not home or not away:
+            continue
+        for market in markets:
+            if not isinstance(market, dict):
+                continue
+            name = first_value(market, ["name", "N", "marketName", "caption"])
+            raw_outcomes = market.get("outcomes") or market.get("Outcomes") or market.get("values")
+            if not isinstance(raw_outcomes, list):
+                continue
+            outs = []
+            for out in raw_outcomes:
+                if isinstance(out, dict):
+                    oname = first_value(out, ["name", "N", "label", "caption"])
+                    odd = finite_number(first_value(out, ["odds", "C", "price", "value"]), minimum=1.000001)
+                    if oname and odd is not None:
+                        outs.append({"name": str(oname), "odds": odd})
+            if name and len({normalize_text(o["name"]) for o in outs}) == 2:
+                normalized.append({"sport": "Football", "event": f"{home} vs {away}", "market": str(name), "outcomes": outs, "updated_at": first_value(market, ["updatedAt", "updated_at"])})
+    if normalized:
+        return normalized, len(events), "1xBet explicit market/outcome schema recognized"
+    return [], len(events), "1xBet fixtures were returned, but no supported explicit two-outcome market/odds objects were found; no odds inferred"
+
+
 def fetch_all_feeds():
-    """Fetch feeds, adapt known source formats, and retain per-source diagnostics."""
+    """Fetch feeds, use source-specific adapters, and retain per-source diagnostics."""
     rows, health = [], []
     for key, config in BOOKMAKERS.items():
         request_url, headers = prepare_feed_request(key, config["feed_url"])
+        if key == "bet9ja":
+            raw_events, diag = fetch_bet9ja_xml(request_url, headers)
+            if diag.get("schema_valid") and raw_events:
+                for raw in raw_events:
+                    row = normalize_feed_event(key, raw)
+                    if row:
+                        rows.append(row)
+                # Adapter already counts the XML records; normalized count must match rows accepted.
+                diag["events_loaded"] = sum(1 for r in rows if r["bookmaker_key"] == key)
+                diag["events_rejected"] = max(0, diag.get("raw_events", 0) - diag["events_loaded"])
+            health.append(diag)
+            continue
+
         payload, diag = safe_fetch_json(request_url, config["name"], headers)
         diag["bookmaker"] = config["name"]
         if payload is None:
@@ -615,24 +888,28 @@ def fetch_all_feeds():
 
         if key == "sportybet":
             raw_events, raw_count, adapter_detail = adapt_sportybet_payload(payload)
-            if raw_events is None:
-                diag.update(status="invalid schema", schema_valid=False, detail=adapter_detail)
-                health.append(diag)
-                continue
-            diag["schema_valid"] = True
-            diag["raw_events"] = raw_count
+        elif key == "betway":
+            raw_events, raw_count, adapter_detail = adapt_betway_payload(payload)
+        elif key == "1xbet":
+            raw_events, raw_count, adapter_detail = adapt_1xbet_payload(payload)
         else:
-            raw_events = payload.get("events")
-            if not isinstance(raw_events, list):
-                diag.update(status="invalid schema", schema_valid=False,
-                            detail='Valid JSON, but expected a top-level "events" array; source-specific adapter not yet implemented')
-                health.append(diag)
-                continue
-            diag["schema_valid"] = True
-            diag["raw_events"] = len(raw_events)
-
+            raw_events, raw_count, adapter_detail = payload.get("events"), 0, "Generic events schema"
+            if isinstance(raw_events, list):
+                raw_count = len(raw_events)
+        if raw_events is None:
+            diag.update(status="invalid schema", schema_valid=False, detail=adapter_detail)
+            health.append(diag)
+            continue
+        if not isinstance(raw_events, list):
+            diag.update(status="invalid schema", schema_valid=False, detail="Adapter returned an unsupported data structure")
+            health.append(diag)
+            continue
+        diag["schema_valid"] = True
+        diag["raw_events"] = raw_count
+        diag["adapter_detail"] = adapter_detail
+        diag["last_successful_fetch"] = diag.get("last_successful_fetch") or now_iso()
         if not raw_events:
-            diag.update(status="no events", detail="Recognized feed schema, but no event-market records were returned")
+            diag.update(status="no usable markets", detail=adapter_detail)
             health.append(diag)
             continue
 
@@ -658,9 +935,8 @@ def fetch_all_feeds():
             diag["stale"] = age > STALE_AFTER_SECONDS
         else:
             diag["stale"] = None
-
         if diag["events_loaded"] == 0:
-            diag.update(status="no usable markets", detail="Schema recognized, but no events matched the supported two-outcome market format")
+            diag.update(status="no usable markets", detail=adapter_detail)
         elif diag["stale"] is True:
             diag.update(status="stale data", detail=f"Usable markets found, but newest event timestamp exceeds {STALE_AFTER_SECONDS}s or may be old")
         elif newest_timestamp is None:
@@ -1271,7 +1547,7 @@ loadHealth();
 # ---------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SolveEase/3.2"
+    server_version = "SolveEase/3.3"
 
     def log_message(self, fmt, *args):
         # Avoid logging query strings, POST bodies, and booking codes.
@@ -1350,7 +1626,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "status": "online",
                 "service": "SolveEase Booking & Arbitrage Dashboard",
-                "version": "3.2",
+                "version": "3.3",
                 "configured_feeds": configured,
                 "feed_status": feed_status,
                 "feed_freshness_threshold_seconds": STALE_AFTER_SECONDS,
@@ -1445,7 +1721,7 @@ def main():
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
-    logging.info("SolveEase dashboard v3.2 listening on port %s", PORT)
+    logging.info("SolveEase dashboard v3.3 listening on port %s", PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
