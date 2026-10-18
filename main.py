@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SolveEase Booking & Arbitrage Dashboard
+SolveEase Booking & Arbitrage Dashboard (v3.5)
 Python standard library only.
 
 Render start command:
@@ -13,44 +13,12 @@ Features:
 - Source-vs-calculated odds diagnostics
 - Ticket reconstruction for manual recreation at SportyBet, Bet9ja, or BetKing
 - Copyable ticket summary; never fabricates destination booking codes
-- Configurable JSON odds feeds for SportyBet, Bet9ja, 1xBet, and Betway
-- Two-outcome arbitrage detection across matching event/market/outcome labels
+- Configurable JSON/XML odds feeds for SportyBet, Bet9ja, 1xBet, and Betway
+- Two-outcome and three-outcome arbitrage detection across matching event/market/outcome labels
 - Feed-supplied probability filter (default 60%)
 - Alternative market prioritization (Over/Under, Double Chance, Corners)
 - Source health and last-scan reporting
 - Privacy-conscious logging (no booking codes or POST bodies logged)
-
-Environment variables:
-    PORT=10000
-    REQUEST_TIMEOUT_SECONDS=12
-    MIN_PROBABILITY=0.60
-    BANKROLL=100000
-    SPORTYBET_ODDS_FEED_URL=https://your-authorized-feed.example/feed.json
-    BET9JA_ODDS_FEED_URL=...
-    ONEXBET_ODDS_FEED_URL=...
-    BETWAY_ODDS_FEED_URL=...
-
-Feed schema:
-{
-  "events": [{
-    "sport": "football",
-    "event": "Home Team vs Away Team",
-    "market": "Total Goals 2.5",
-    "updated_at": "2026-10-18T12:00:00Z",
-    "outcomes": [
-      {"name": "Over 2.5", "odds": 2.10, "estimated_probability": 0.62},
-      {"name": "Under 2.5", "odds": 1.90, "estimated_probability": 0.38}
-    ]
-  }]
-}
-
-IMPORTANT:
-- Only use feeds you control or are authorized to access.
-- The SportyBet share endpoint is unofficial and may change.
-- No bets are placed, and no bookmaker login credentials are requested.
-- This app does not generate valid destination booking codes.
-- Feed-provided probability estimates are not independently validated.
-- An empty scan caused by unavailable feeds is not proof that no arbitrage exists.
 """
 
 import json
@@ -444,10 +412,7 @@ def lookup_sportybet(code):
 # ---------------------------------------------------------------------
 
 def prepare_feed_request(bookmaker_key, configured_url):
-    """Resolve homepage URLs to source-specific public data candidates.
-
-    These are candidates, not guarantees: the bookmaker can change or restrict them.
-    """
+    """Resolve homepage URLs to source-specific public data candidates."""
     if not configured_url:
         return configured_url, {}
     try:
@@ -474,23 +439,18 @@ def prepare_feed_request(bookmaker_key, configured_url):
         return configured_url, {"Current-Country": "NG", "Referer": "https://www.sportybet.com/ng/"}
 
     if bookmaker_key == "bet9ja":
-        # The configured /Sport/Odds page is HTML. Use the documented MarketWS XML operation.
         if host in ("web.bet9ja.com", "www.bet9ja.com") and ("marketws.asmx" in path or path == "/sport/odds" or path == ""):
             return "https://web.bet9ja.com/Controls/MarketWS.asmx", {"Referer": "https://web.bet9ja.com/Sport/Odds", "Accept": "text/xml, application/xml, */*"}
         if host.endswith("bet9ja.com") and "/controls/marketws.asmx" in path:
             return configured_url, {"Referer": "https://web.bet9ja.com/Sport/Odds", "Accept": "text/xml, application/xml, */*"}
 
     if bookmaker_key == "1xbet":
-        # Public LineFeed endpoint candidate for football fixtures. The adapter only accepts
-        # actual market/outcome odds fields; fixture names alone are never treated as odds.
         if host == "1xbet.ng" or host.endswith(".1xbet.ng"):
             if "/linefeed/" not in path:
                 params = {"sports": "1", "count": "1000", "lng": "en", "mode": "4", "country": "1"}
                 return "https://1xbet.ng/LineFeed/BestGamesExtZip?" + urlencode(params), {"Accept": "application/json, text/plain, */*", "Referer": "https://1xbet.ng/en"}
 
     if bookmaker_key == "betway":
-        # Candidate endpoint documented for Betway's South African site. Nigeria host is
-        # deliberately retained; it may 404 if that regional site uses another backend.
         if host == "betway.com.ng" or host.endswith(".betway.com.ng"):
             if "/sportsapi/" not in path:
                 return "https://www.betway.com.ng/sportsapi/br/v1/BetBook/Highlights/", {"Accept": "application/json, text/plain, */*", "Referer": "https://www.betway.com.ng/"}
@@ -498,11 +458,7 @@ def prepare_feed_request(bookmaker_key, configured_url):
 
 
 def adapt_sportybet_payload(payload):
-    """Convert SportyBet's nested factsCenter response into normalized event-market records.
-
-    Documented shape: data.tournaments[].events[].markets[].outcomes[].
-    This adapter deliberately does not invent probabilities or update timestamps.
-    """
+    """Convert SportyBet's nested factsCenter response into normalized event-market records."""
     if not isinstance(payload, dict):
         return None, 0, "SportyBet JSON root is not an object"
     biz_code = payload.get("bizCode")
@@ -548,12 +504,7 @@ def adapt_sportybet_payload(payload):
                     name = str(outcome.get("desc") or outcome.get("name") or "").strip()
                     if odds is None or not name or outcome.get("isActive") is False:
                         continue
-                    parsed_outcomes.append({
-                        "name": name,
-                        "odds": odds,
-                        # SportyBet's ordinary odds response does not provide a validated
-                        # model probability; never manufacture one from the odds.
-                    })
+                    parsed_outcomes.append({"name": name, "odds": odds})
                 market_name = str(market.get("desc") or market.get("name") or "").strip()
                 specifier = str(market.get("specifier") or "").strip()
                 if specifier:
@@ -565,59 +516,190 @@ def adapt_sportybet_payload(payload):
                     "event": event_name,
                     "market": market_name,
                     "outcomes": parsed_outcomes,
-                    # Do not use scheduled kick-off as an odds-update timestamp.
                     "updated_at": first_value(market, ["updated_at", "updatedAt", "lastUpdateTime", "updateTime"]),
                     "league": tournament_name,
                 })
     return normalized, raw_market_count, "SportyBet nested schema recognized"
 
 
+def split_event_teams(event):
+    """Split common home-versus-away labels while preserving team order."""
+    value = str(event or "").strip()
+    parts = re.split(
+        r"\s+(?:vs\.?|v\.?|versus)\s+|\s+[-–—]\s+",
+        value,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )
+    if len(parts) == 2 and all(part.strip() for part in parts):
+        return parts[0].strip(), parts[1].strip()
+    return None, None
+
+
+def canonical_event_key(event):
+    home, away = split_event_teams(event)
+    if home and away:
+        return normalize_text(home) + " vs " + normalize_text(away)
+    return normalize_text(event)
+
+
+def canonical_outcome_key(name, home=None, away=None, allow_1x2=False):
+    """Canonicalize 1X2 labels only when the market is demonstrably 1X2."""
+    label = normalize_text(name)
+    home_key = normalize_text(home) if home else ""
+    away_key = normalize_text(away) if away else ""
+
+    if allow_1x2:
+        if label in {"1", "home", "home win", "1x2 home"}:
+            return "home"
+        if label in {"x", "draw", "tie", "match drawn"}:
+            return "draw"
+        if label in {"2", "away", "away win", "1x2 away"}:
+            return "away"
+
+        if home_key and label in {home_key, home_key + " win"}:
+            return "home"
+        if away_key and label in {away_key, away_key + " win"}:
+            return "away"
+
+    return label
+
+
 def normalize_feed_event(bookmaker_key, raw):
     if not isinstance(raw, dict):
         return None
+
+    if bookmaker_key not in BOOKMAKERS:
+        return None
+
     sport = str(raw.get("sport") or "Unknown sport").strip()
     event = str(raw.get("event") or raw.get("fixture") or "").strip()
     market = str(raw.get("market") or "").strip()
     outcomes = raw.get("outcomes")
+
     if not event or not market or not isinstance(outcomes, list):
         return None
 
-    unique = {}
+    home, away = split_event_teams(event)
+    market_key = normalize_text(market)
+
+    # Double Chance outcomes overlap and are not mutually exclusive.
+    if (
+        "double chance" in market_key
+        or market_key in {"1x", "12", "x2"}
+        or re.search(r"\bdouble\s+chance\b", market_key)
+    ):
+        return None
+
+    raw_valid = []
     for outcome in outcomes:
         if not isinstance(outcome, dict):
             continue
-        name = str(outcome.get("name") or outcome.get("selection") or "").strip()
-        odds = finite_number(outcome.get("odds"), minimum=1.000001)
+
+        name = str(
+            outcome.get("name") or outcome.get("selection") or ""
+        ).strip()
+        odds = finite_number(
+            outcome.get("odds"), minimum=1.000001
+        )
+
         if not name or odds is None:
             continue
-        key = normalize_text(name)
-        if not key:
-            continue
-        probability = finite_number(
-            outcome.get("estimated_probability"), minimum=0, maximum=1
-        )
-        unique[key] = {
-            "name": name,
-            "name_key": key,
-            "odds": odds,
-            "estimated_probability": probability,
-        }
 
-    normalized_outcomes = list(unique.values())
-    # Conservative: exactly two unique outcomes per market record.
-    if len(normalized_outcomes) != 2:
+        raw_valid.append({
+            "name": name,
+            "odds": odds,
+            "estimated_probability": finite_number(
+                outcome.get("estimated_probability"),
+                minimum=0,
+                maximum=1,
+            ),
+        })
+
+    # Duplicate labels are ambiguous: do not silently overwrite a price.
+    raw_keys = [normalize_text(item["name"]) for item in raw_valid]
+    if len(raw_keys) != len(set(raw_keys)):
         return None
+
+    labels = set(raw_keys)
+    market_suggests_1x2 = bool(re.search(
+        r"\b(1x2|match result|full time result|"
+        r"90 minutes result|three way result)\b",
+        market_key,
+    ))
+
+    draw_labels = {
+        "x", "draw", "tie", "match drawn"
+    }
+    has_draw = bool(labels & draw_labels)
+
+    # A clear three-way set can establish 1X2 even when the
+    # source uses a generic market title.
+    has_home_label = bool(labels & {"1", "home", "home win"})
+    has_away_label = bool(labels & {"2", "away", "away win"})
+    is_1x2 = (
+        len(raw_valid) == 3
+        and (
+            market_suggests_1x2
+            or (has_draw and has_home_label and has_away_label)
+        )
+    )
+
+    # Do not accept an ambiguous partial 1X2 market.
+    if market_suggests_1x2 and len(raw_valid) != 3:
+        return None
+
+    normalized_outcomes = []
+    for item in raw_valid:
+        key = canonical_outcome_key(
+            item["name"], home, away, allow_1x2=is_1x2
+        )
+        if not key:
+            return None
+
+        normalized_outcomes.append({
+            "name": item["name"],
+            "name_key": key,
+            "odds": item["odds"],
+            "estimated_probability": item["estimated_probability"],
+        })
+
+    if len(normalized_outcomes) not in (2, 3):
+        return None
+
+    outcome_keys = [
+        item["name_key"] for item in normalized_outcomes
+    ]
+    if len(outcome_keys) != len(set(outcome_keys)):
+        return None
+
+    if is_1x2:
+        if set(outcome_keys) != {"home", "draw", "away"}:
+            return None
+        market_key = "football_1x2"
+
+    # Preserve timestamp information so stale rows can be excluded
+    # from theoretical arbitrage calculations.
+    updated_at = raw.get("updated_at")
+    stamp = parse_timestamp(updated_at)
+    stale = None
+    if stamp is not None:
+        age_seconds = (
+            datetime.now(timezone.utc) - stamp
+        ).total_seconds()
+        stale = age_seconds > STALE_AFTER_SECONDS
 
     return {
         "bookmaker_key": bookmaker_key,
         "bookmaker": BOOKMAKERS[bookmaker_key]["name"],
         "sport": sport,
         "event": event,
-        "event_key": normalize_text(event),
+        "event_key": canonical_event_key(event),
         "market": market,
-        "market_key": normalize_text(market),
+        "market_key": market_key,
         "outcomes": normalized_outcomes,
-        "updated_at": raw.get("updated_at"),
+        "updated_at": updated_at,
+        "stale": stale,
     }
 
 
@@ -635,7 +717,7 @@ def safe_fetch_xml(url, label, extra_headers=None):
     if not url:
         diag["detail"] = "No feed URL configured"
         return None, diag
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; SolveEaseFeedMonitor/3.3)", "Accept": "text/xml, application/xml, */*"}
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; SolveEaseFeedMonitor/3.5)", "Accept": "text/xml, application/xml, */*"}
     if extra_headers:
         headers.update(extra_headers)
     request = Request(url, headers=headers, method="GET")
@@ -685,10 +767,7 @@ def _xml_child_text(node, names):
 
 
 def fetch_bet9ja_xml(configured_url, headers):
-    """Probe Bet9ja's documented XML service, discover football sport ID, then request odds.
-
-    This uses the published service interface only. It does not evade a 403/WAF response.
-    """
+    """Probe Bet9ja's documented XML service, discover football sport ID, then request odds."""
     base = "https://web.bet9ja.com/Controls/MarketWS.asmx"
     params = {"strQuotaMax": "1000", "tipoVisQuote": "0"}
     sport_url = base + "/GetListSport_OddLessThan?" + urlencode(params)
@@ -706,26 +785,23 @@ def fetch_bet9ja_xml(configured_url, headers):
             sport_id = ident
             break
     if not sport_id:
-        diag.update(status="invalid schema", schema_valid=False, detail="Bet9ja XML parsed, but no football sport ID was identified in the published service response")
+        diag.update(status="invalid schema", schema_valid=False, detail="Bet9ja XML parsed, but no football sport ID was identified")
         diag["bookmaker"] = "Bet9ja"
         return [], diag
     odds_params = {"strQuotaMax": "1000", "strIDSport": sport_id, "typeOrder": "0", "tipoVisQuote": "0"}
     odds_url = base + "/GetListOdds_OddLessThan?" + urlencode(odds_params)
     odds_root, odds_diag = safe_fetch_xml(odds_url, "Bet9ja odds", headers)
-    # Prefer the odds response diagnostics; include both request durations and sizes.
     odds_diag["fetch_ms"] += diag.get("fetch_ms", 0)
     odds_diag["response_bytes"] += diag.get("response_bytes", 0)
     odds_diag["bookmaker"] = "Bet9ja"
     if odds_root is None:
-        odds_diag["detail"] = "Football sport ID discovered, but the Bet9ja odds operation failed: " + odds_diag.get("detail", "unknown error")
+        odds_diag["detail"] = "Football sport ID discovered, but Bet9ja odds operation failed: " + odds_diag.get("detail", "unknown error")
         return [], odds_diag
 
     odds_diag["schema_valid"] = True
     odds_diag["status"] = "XML schema recognized; checking quote fields"
     odds_diag["last_successful_fetch"] = odds_diag.get("last_successful_fetch") or now_iso()
     normalized = []
-    # The published service exposes SubEvents, OddClass and Quote/clsQuoteList.
-    # Parse conservatively: only emit a market when two named selections have numeric decimal odds.
     for subevent in odds_root.iter():
         if _xml_local(subevent.tag) != "clssubeventslist":
             continue
@@ -752,24 +828,23 @@ def fetch_bet9ja_xml(configured_url, headers):
                     break
             if odds is not None and label:
                 selections.append({"name": label, "odds": odds})
-        # Keep unique labels only; skip unclear or 3-way markets.
         unique = {normalize_text(o["name"]): o for o in selections if normalize_text(o["name"])}
-        if len(unique) == 2:
+        if len(unique) in (2, 3):
             normalized.append({"sport": "Football", "event": event_name, "market": subevent_name or "Bet9ja market", "outcomes": list(unique.values()), "updated_at": None})
     odds_diag["raw_events"] = sum(1 for n in odds_root.iter() if _xml_local(n.tag) == "clssubeventslist")
     odds_diag["events_loaded"] = len(normalized)
     odds_diag["events_rejected"] = max(0, odds_diag["raw_events"] - len(normalized))
     if normalized:
-        odds_diag.update(status="usable markets; freshness unknown", detail="Bet9ja XML returned named two-outcome markets; update timestamps were not confirmed")
+        odds_diag.update(status="usable markets; freshness unknown", detail="Bet9ja XML returned named multi-outcome markets")
     elif odds_diag["raw_events"]:
-        odds_diag.update(status="no usable markets", detail="Bet9ja XML parsed, but quote field names/values did not yield exactly two named decimal-odds outcomes; adapter needs a sample response to map safely")
+        odds_diag.update(status="no usable markets", detail="Bet9ja XML parsed, but quote field names did not yield valid decimal-odds outcomes")
     else:
         odds_diag.update(status="no events", detail="Bet9ja XML schema parsed, but no subevents were returned")
     return normalized, odds_diag
 
 
 def adapt_betway_payload(payload):
-    """Normalize Betway's documented flat event/market/outcome/price arrays when present."""
+    """Normalize Betway's documented flat event/market/outcome/price arrays."""
     if not isinstance(payload, dict):
         return None, 0, "Betway JSON root is not an object"
     def arr(*names):
@@ -783,7 +858,7 @@ def adapt_betway_payload(payload):
     outcomes = arr("outcomes", "Outcomes", "selections", "Selections")
     prices = arr("prices", "Prices", "odds", "Odds")
     if not events or not markets or not outcomes:
-        return None, len(events), "Valid JSON, but expected Betway flat arrays (events, markets, outcomes, prices) were not all present"
+        return None, len(events), "Valid JSON, but expected Betway flat arrays were not all present"
     def pick(obj, *keys):
         return first_value(obj, keys)
     event_by_id = {}
@@ -819,13 +894,13 @@ def adapt_betway_payload(payload):
         event_name = event_by_id.get(str(eid))
         market_name = pick(market, "name", "marketName", "MarketName", "caption", "Caption", "description", "Description")
         vals = outcomes_by_market.get(str(mid), [])
-        if event_name and market_name and len({normalize_text(x["name"]) for x in vals}) == 2:
+        if event_name and market_name and len({normalize_text(x["name"]) for x in vals}) in (2, 3):
             normalized.append({"sport": "Football", "event": event_name, "market": str(market_name), "outcomes": vals, "updated_at": pick(market, "updatedAt", "updated_at", "lastUpdate")})
     return normalized, len(events), "Betway flat-array schema recognized"
 
 
 def adapt_1xbet_payload(payload):
-    """Recognize 1xBet LineFeed fixture payloads without inventing unsupported odds."""
+    """Recognize 1xBet LineFeed fixture payloads."""
     if not isinstance(payload, dict) or not isinstance(payload.get("Value"), list):
         return None, 0, 'Valid JSON, but expected 1xBet LineFeed "Value" array'
     events = payload.get("Value", [])
@@ -833,7 +908,6 @@ def adapt_1xbet_payload(payload):
     for item in events:
         if not isinstance(item, dict):
             continue
-        # Only accept explicit market/outcome collections; fixture-level labels are not prices.
         markets = item.get("markets") or item.get("Markets") or item.get("E")
         if not isinstance(markets, list):
             continue
@@ -855,120 +929,192 @@ def adapt_1xbet_payload(payload):
                     odd = finite_number(first_value(out, ["odds", "C", "price", "value"]), minimum=1.000001)
                     if oname and odd is not None:
                         outs.append({"name": str(oname), "odds": odd})
-            if name and len({normalize_text(o["name"]) for o in outs}) == 2:
+            if name and len({normalize_text(o["name"]) for o in outs}) in (2, 3):
                 normalized.append({"sport": "Football", "event": f"{home} vs {away}", "market": str(name), "outcomes": outs, "updated_at": first_value(market, ["updatedAt", "updated_at"])})
     if normalized:
         return normalized, len(events), "1xBet explicit market/outcome schema recognized"
-    return [], len(events), "1xBet fixtures were returned, but no supported explicit two-outcome market/odds objects were found; no odds inferred"
+    return [], len(events), "1xBet fixtures returned, but no supported multi-outcome market objects found"
 
 
 def fetch_all_feeds():
-    """Fetch feeds, use source-specific adapters, and retain per-source diagnostics."""
+    """Fetch configured feeds and retain per-source diagnostics."""
     rows, health = [], []
+
     for key, config in BOOKMAKERS.items():
-        request_url, headers = prepare_feed_request(key, config["feed_url"])
-        if key == "bet9ja":
+        request_url, headers = prepare_feed_request(
+            key, config["feed_url"]
+        )
+
+        if key == "bet9ja" and ".asmx" in request_url.lower():
             raw_events, diag = fetch_bet9ja_xml(request_url, headers)
-            if diag.get("schema_valid") and raw_events:
-                for raw in raw_events:
-                    row = normalize_feed_event(key, raw)
-                    if row:
-                        rows.append(row)
-                # Adapter already counts the XML records; normalized count must match rows accepted.
-                diag["events_loaded"] = sum(1 for r in rows if r["bookmaker_key"] == key)
-                diag["events_rejected"] = max(0, diag.get("raw_events", 0) - diag["events_loaded"])
+            diag["bookmaker"] = config["name"]
+
+            for raw in raw_events:
+                row = normalize_feed_event(key, raw)
+                if row:
+                    rows.append(row)
+
+            diag["events_loaded"] = sum(
+                1 for row in rows if row["bookmaker_key"] == key
+            )
+            diag["events_rejected"] = max(
+                0, diag.get("raw_events", 0) - diag["events_loaded"]
+            )
             health.append(diag)
             continue
 
-        payload, diag = safe_fetch_json(request_url, config["name"], headers)
+        payload, diag = safe_fetch_json(
+            request_url, config["name"], headers
+        )
         diag["bookmaker"] = config["name"]
+
         if payload is None:
             health.append(diag)
             continue
 
         if key == "sportybet":
-            raw_events, raw_count, adapter_detail = adapt_sportybet_payload(payload)
+            raw_events, raw_count, detail = adapt_sportybet_payload(payload)
         elif key == "betway":
-            raw_events, raw_count, adapter_detail = adapt_betway_payload(payload)
+            raw_events, raw_count, detail = adapt_betway_payload(payload)
         elif key == "1xbet":
-            raw_events, raw_count, adapter_detail = adapt_1xbet_payload(payload)
+            raw_events, raw_count, detail = adapt_1xbet_payload(payload)
         else:
-            raw_events, raw_count, adapter_detail = payload.get("events"), 0, "Generic events schema"
-            if isinstance(raw_events, list):
-                raw_count = len(raw_events)
-        if raw_events is None:
-            diag.update(status="invalid schema", schema_valid=False, detail=adapter_detail)
-            health.append(diag)
-            continue
-        if not isinstance(raw_events, list):
-            diag.update(status="invalid schema", schema_valid=False, detail="Adapter returned an unsupported data structure")
-            health.append(diag)
-            continue
-        diag["schema_valid"] = True
-        diag["raw_events"] = raw_count
-        diag["adapter_detail"] = adapter_detail
-        diag["last_successful_fetch"] = diag.get("last_successful_fetch") or now_iso()
-        if not raw_events:
-            diag.update(status="no usable markets", detail=adapter_detail)
+            raw_events = payload.get("events")
+            raw_count = len(raw_events) if isinstance(raw_events, list) else 0
+            detail = (
+                "Generic events schema recognized"
+                if isinstance(raw_events, list)
+                else 'Valid JSON, but expected an "events" array'
+            )
+
+        if raw_events is None or not isinstance(raw_events, list):
+            diag.update(
+                status="invalid schema",
+                schema_valid=False,
+                detail=detail,
+            )
             health.append(diag)
             continue
 
-        rejection_reasons = {}
+        diag["schema_valid"] = True
+        diag["raw_events"] = raw_count
+        diag["adapter_detail"] = detail
+        diag["rejection_reasons"] = {}
         newest_timestamp = None
+
         for raw in raw_events:
             row = normalize_feed_event(key, raw)
             if row:
                 rows.append(row)
                 diag["events_loaded"] += 1
+
                 stamp = parse_timestamp(row.get("updated_at"))
-                if stamp and (newest_timestamp is None or stamp > newest_timestamp):
+                if stamp and (
+                    newest_timestamp is None or stamp > newest_timestamp
+                ):
                     newest_timestamp = stamp
             else:
                 diag["events_rejected"] += 1
-                reason = "not an object" if not isinstance(raw, dict) else "missing event/market/outcomes, invalid odds, or not exactly two unique outcomes"
-                rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
-        diag["rejection_reasons"] = rejection_reasons
+                reason = (
+                    "not an object"
+                    if not isinstance(raw, dict)
+                    else "invalid event, market, odds, or outcome set"
+                )
+                reasons = diag["rejection_reasons"]
+                reasons[reason] = reasons.get(reason, 0) + 1
+
         if newest_timestamp:
-            age = max(0, int((datetime.now(timezone.utc) - newest_timestamp).total_seconds()))
+            age = max(
+                0,
+                int(
+                    (
+                        datetime.now(timezone.utc) - newest_timestamp
+                    ).total_seconds()
+                ),
+            )
             diag["data_updated_at"] = newest_timestamp.isoformat()
             diag["freshness_seconds"] = age
             diag["stale"] = age > STALE_AFTER_SECONDS
         else:
             diag["stale"] = None
+
         if diag["events_loaded"] == 0:
-            diag.update(status="no usable markets", detail=adapter_detail)
+            diag.update(
+                status="no usable markets",
+                detail=detail,
+            )
         elif diag["stale"] is True:
-            diag.update(status="stale data", detail=f"Usable markets found, but newest event timestamp exceeds {STALE_AFTER_SECONDS}s or may be old")
+            diag.update(
+                status="stale data",
+                detail="Usable markets found, but the newest provided timestamp is stale",
+            )
         elif newest_timestamp is None:
-            diag.update(status="usable markets; freshness unknown", detail="Usable markets found; source did not provide a parseable odds-update timestamp")
+            diag.update(
+                status="usable markets; freshness unknown",
+                detail="Markets parsed; no valid odds-update timestamp was supplied",
+            )
         else:
-            diag.update(status="usable markets", detail="Source schema recognized and usable two-outcome markets parsed; source authenticity and odds accuracy are not independently verified")
+            diag.update(
+                status="usable markets",
+                detail=(
+                    "Markets parsed. Odds accuracy and source authenticity "
+                    "are not independently verified."
+                ),
+            )
+
         health.append(diag)
+
     return rows, health
 
 
 def find_arbitrage(rows):
     groups = {}
+
     for row in rows:
-        key = (row["sport"].lower(), row["event_key"], row["market_key"])
+        if row.get("stale") is True:
+            continue
+
+        key = (
+            normalize_text(row.get("sport")),
+            row.get("event_key"),
+            row.get("market_key"),
+        )
         groups.setdefault(key, []).append(row)
 
     opportunities = []
-    for _, market_rows in groups.items():
-        if len({row["bookmaker_key"] for row in market_rows}) < 2:
+
+    for market_rows in groups.values():
+        if len({
+            row["bookmaker_key"] for row in market_rows
+        }) < 2:
             continue
 
-        outcome_names = set()
-        for row in market_rows:
-            outcome_names.update(outcome["name_key"] for outcome in row["outcomes"])
-        if len(outcome_names) != 2:
+        outcome_sets = [
+            frozenset(
+                outcome["name_key"]
+                for outcome in row["outcomes"]
+            )
+            for row in market_rows
+        ]
+
+        # Different outcome sets cannot be combined safely.
+        if not outcome_sets or len(set(outcome_sets)) != 1:
             continue
-        if any({o["name_key"] for o in row["outcomes"]} != outcome_names for row in market_rows):
+
+        outcome_names = set(outcome_sets[0])
+        if len(outcome_names) not in (2, 3):
+            continue
+
+        market_label = normalize_text(
+            market_rows[0].get("market", "")
+        )
+        if "double chance" in market_label:
             continue
 
         best = {}
         for outcome_name in outcome_names:
             quotes = []
+
             for row in market_rows:
                 for outcome in row["outcomes"]:
                     if outcome["name_key"] == outcome_name:
@@ -977,36 +1123,61 @@ def find_arbitrage(rows):
                             "bookmaker_key": row["bookmaker_key"],
                             "odds": outcome["odds"],
                             "selection": outcome["name"],
+                            "updated_at": row.get("updated_at"),
                         })
-            if quotes:
-                best[outcome_name] = max(quotes, key=lambda quote: quote["odds"])
 
-        if len(best) != 2:
+            if not quotes:
+                break
+
+            best[outcome_name] = max(
+                quotes, key=lambda quote: quote["odds"]
+            )
+
+        if set(best) != outcome_names:
             continue
-        probability_sum = sum(1.0 / quote["odds"] for quote in best.values())
-        if probability_sum >= 1:
+
+        implied_sum = sum(
+            1.0 / quote["odds"]
+            for quote in best.values()
+        )
+
+        if implied_sum >= 1.0:
             continue
 
         legs = []
-        for quote in best.values():
-            leg = dict(quote)
-            leg["stake_fraction"] = (1.0 / leg["odds"]) / probability_sum
-            legs.append(leg)
+        for outcome_name in sorted(outcome_names):
+            quote = dict(best[outcome_name])
+            quote["stake_fraction"] = (
+                (1.0 / quote["odds"]) / implied_sum
+            )
+            quote["stake_amount"] = round(
+                BANKROLL * quote["stake_fraction"], 2
+            )
+            legs.append(quote)
+
+        theoretical_margin = (1.0 - implied_sum) * 100.0
 
         opportunities.append({
             "sport": market_rows[0]["sport"],
             "event": market_rows[0]["event"],
             "market": market_rows[0]["market"],
-            "implied_probability_sum": probability_sum * 100.0,
-            "theoretical_margin_percent": (1.0 - probability_sum) * 100.0,
+            "outcome_count": len(outcome_names),
+            "implied_probability_sum": implied_sum * 100.0,
+            "theoretical_margin_percent": theoretical_margin,
+            "theoretical_bankroll": BANKROLL,
             "legs": legs,
             "warning": (
-                "Theoretical only. Confirm matching event, exact line, "
-                "settlement rules, odds freshness, limits, and fees."
+                "Theoretical only. Confirm the same event, market, "
+                "line, settlement rules, current prices, limits, "
+                "fees and availability at every bookmaker. "
+                "Stakes are illustrative and do not guarantee profit."
             ),
         })
 
-    opportunities.sort(key=lambda item: item["theoretical_margin_percent"], reverse=True)
+    opportunities.sort(
+        key=lambda item: item["theoretical_margin_percent"],
+        reverse=True,
+    )
     return opportunities
 
 
@@ -1035,10 +1206,7 @@ def filter_probabilities(rows, threshold=MIN_PROBABILITY):
                 "bookmaker": row["bookmaker"], "odds": outcome["odds"],
                 "estimated_probability": probability, "threshold": threshold,
                 "priority_market": priority,
-                "evidence": (
-                    "Estimate supplied by configured feed; not independently "
-                    "validated by SolveEase."
-                ),
+                "evidence": "Estimate supplied by configured feed; not independently validated.",
             })
     eligible.sort(
         key=lambda item: (item["priority_market"], item["estimated_probability"]),
@@ -1062,10 +1230,7 @@ def alternative_markets(rows, threshold=MIN_PROBABILITY):
                 "market": row["market"], "selection": outcome["name"],
                 "bookmaker": row["bookmaker"], "odds": outcome["odds"],
                 "estimated_probability": probability,
-                "note": (
-                    "Candidate only. Confirm exact line, market rules, and "
-                    "source freshness before considering use."
-                ),
+                "note": "Candidate only. Confirm exact line, market rules, and freshness.",
             })
 
     result = []
@@ -1084,7 +1249,13 @@ def run_scan():
         "ok": True,
         "scanned_at": now_iso(),
         "bookmakers": health,
-        "usable_two_outcome_markets": len(rows),
+        "usable_markets": len(rows),
+        "usable_two_outcome_markets": sum(
+            1 for row in rows if len(row["outcomes"]) == 2
+        ),
+        "usable_three_outcome_markets": sum(
+            1 for row in rows if len(row["outcomes"]) == 3
+        ),
         "arbitrage_count": len(arbitrage),
         "arbitrage": arbitrage,
         "probability_filter_threshold": MIN_PROBABILITY,
@@ -1096,7 +1267,6 @@ def run_scan():
             "No opportunity is displayed unless configured feed data qualifies.",
             "A feed-provided probability estimate is not a guarantee.",
             "Both outcomes must be exhaustive and use identical settlement rules.",
-            "Unavailable feeds do not count as a negative arbitrage result.",
         ],
     }
     global LAST_SCAN, LAST_FEED_STATUS
@@ -1165,21 +1335,21 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
 
 <section class="panel" id="lookupPanel">
   <h2>1. Booking-code lookup</h2>
-  <p>Enter a code and the dashboard will verify it using the lookup adapters currently available.</p>
+  <p>Enter a code and the dashboard will verify it using lookup adapters currently available.</p>
   <label for="code">Booking code</label>
   <input id="code" maxlength="120" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Enter booking code">
   <div class="actions">
     <button id="lookupBtn" onclick="lookup()">Identify & look up</button>
     <button class="secondary" onclick="clearLookup()">Clear ticket</button>
   </div>
-  <p class="small">Currently supported: SportyBet read-only lookup. Bet9ja and BetKing are not confirmed from code format alone and do not yet have lookup adapters.</p>
+  <p class="small">Currently supported: SportyBet read-only lookup. Bet9ja and BetKing require manual reconstruction.</p>
   <div id="lookupMessage" role="status" aria-live="polite"></div>
   <div id="ticketResult"></div>
 </section>
 
 <section class="panel" id="converterPanel">
   <h2>2. Bookmaker ticket converter</h2>
-  <p>Prepare a copyable checklist from a successfully retrieved ticket for manual recreation at another bookmaker.</p>
+  <p>Prepare a copyable checklist from a successfully retrieved ticket for manual recreation.</p>
   <label for="destinationBookmaker">Destination bookmaker</label>
   <select id="destinationBookmaker">
     <option value="sportybet">SportyBet</option>
@@ -1193,12 +1363,12 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
   <div id="converterMessage" role="status" aria-live="polite"></div>
   <div id="converterSummary" class="grid"></div>
   <pre id="convertedTicket" class="item">Look up a supported booking code first.</pre>
-  <p class="small notice">Manual reconstruction only. This does not generate a destination booking code or prove that equivalent markets are available. Verify each event, market, selection, line and current price yourself.</p>
+  <p class="small notice">Manual reconstruction only. This does not generate a destination booking code.</p>
 </section>
 
 <section class="panel" id="scannerPanel">
   <h2>3. Arbitrage scanner</h2>
-  <p>Scans only the permitted JSON odds feeds configured on the server. Missing feeds are reported as unavailable, not as proof that no opportunity exists.</p>
+  <p>Scans permitted JSON odds feeds configured on the server.</p>
   <div class="actions">
     <button id="scanBtn" onclick="scan()">Scan bookmakers now</button>
     <button class="secondary" onclick="loadHealth()">Refresh service status</button>
@@ -1208,19 +1378,17 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
   <div id="scanSummary" class="grid"></div>
   <h3>Arbitrage opportunities</h3><div id="arbitrage"></div>
   <h3>Probability filter</h3>
-  <p class="small">Default threshold: 60%. Uses estimates supplied by the configured feed, not odds-implied probabilities.</p>
+  <p class="small">Default threshold: 60%.</p>
   <div id="probabilities"></div>
   <h3>Preferred alternative markets</h3>
-  <p class="small">Priorities include Over/Under, Double Chance and Corners where supported by feed data.</p>
   <div id="alternatives"></div>
 </section>
 
 <section class="panel">
   <h2>Service status</h2>
   <div id="health">Checking service…</div>
-  <p class="small">Read-only tools. No automatic bet placement and no bookmaker login credentials requested. Odds and availability can change rapidly.</p>
 </section>
-<footer>SolveEase · Mobile-friendly · Manual confirmation required · No automatic bet placement</footer>
+<footer>SolveEase · Mobile-friendly · Manual confirmation required</footer>
 </main>
 <script>
 "use strict";
@@ -1302,20 +1470,13 @@ async function lookup() {
       ["Calculated odds", money(data.calculated_combined_odds)],
       ["Odds agree", data.odds_agree === null ? "Cannot verify" : (data.odds_agree ? "Yes" : "No")],
       ["Ticket status", data.status],
-      ["Stake", data.stake == null ? "Not provided" : String(data.stake) + " (units unverified)"],
-      ["Potential return", data.potential_return == null ? "Not provided" : String(data.potential_return) + " (units unverified)"]
+      ["Stake", data.stake == null ? "Not provided" : String(data.stake)],
+      ["Potential return", data.potential_return == null ? "Not provided" : String(data.potential_return)]
     ].forEach(([label,value]) => {
       const stat = el("div", "", stats, "stat");
       el("span", label, stat);
       el("strong", value ?? "Not provided", stat);
     });
-
-    if (data.odds_agree === false) {
-      el("p", "Warning: source odds and calculated odds differ. At least one selection or odds value may be missing or interpreted differently. Review every leg.", box, "warning");
-    }
-    if (data.source_selection_count !== data.displayed_selections_count) {
-      el("p", "Warning: source selection count differs from the displayed outcome count.", box, "warning");
-    }
 
     el("h3", "Ticket selections", box);
     (data.legs || []).forEach(leg => {
@@ -1324,9 +1485,7 @@ async function lookup() {
       el("p", "Market: " + (leg.market || "Needs verification"), card);
       el("p", "Selection: " + (leg.selection || "Needs verification"), card);
       el("p", "Source odds: " + (leg.odds_verified ? money(leg.odds, 3) : "Unverified"), card);
-      if (leg.kickoff) el("p", "Kickoff/source time: " + leg.kickoff, card, "small");
     });
-    el("p", data.note || "Verify details at the source bookmaker.", box, "small");
   } catch (err) {
     $("lookupMessage").textContent = err.message;
     $("lookupMessage").className = "error";
@@ -1352,62 +1511,26 @@ function prepareConversion() {
   }
 
   const destinationName = names[destination] || "Selected bookmaker";
-  const sameSource = String(data.bookmaker_key || "").toLowerCase() === destination;
-  let needsVerification = 0;
   const lines = [
     "SOLVEEASE — MANUAL TICKET RECONSTRUCTION",
     "Source bookmaker: " + (data.bookmaker || "Unknown"),
     "Destination bookmaker: " + destinationName,
-    "Source ticket retrieved: " + (data.retrieved_at || "Time unavailable"),
-    "Displayed selections: " + data.legs.length,
-    "",
     "STATUS: NOT A DESTINATION BOOKING CODE",
-    "This checklist has not been matched against the destination's live markets.",
     ""
   ];
 
   data.legs.forEach((leg, index) => {
-    const hasOdds = leg.odds_verified === true && Number.isFinite(Number(leg.odds));
-    const event = String(leg.event || "Event unavailable");
-    const market = String(leg.market || "Market needs verification");
-    const selection = String(leg.selection || "Selection needs verification");
-    const ambiguous = !hasOdds ||
-      /needs verification|unavailable|not identifiable/i.test(market + " " + selection + " " + event);
-    if (ambiguous) needsVerification++;
-
     lines.push(
-      (index + 1) + ". " + event,
-      "   Market: " + market,
-      "   Selection: " + selection,
-      "   Source odds: " + (hasOdds ? Number(leg.odds).toFixed(3) : "Unverified"),
-      "   Destination match: " + (ambiguous ? "REQUIRES MANUAL IDENTIFICATION" : "NOT YET VERIFIED"),
-      "   Current destination odds: Check directly with bookmaker",
+      (index + 1) + ". " + String(leg.event || "Event"),
+      "   Market: " + String(leg.market || "Market"),
+      "   Selection: " + String(leg.selection || "Selection"),
+      "   Source odds: " + (leg.odds_verified ? Number(leg.odds).toFixed(3) : "Unverified"),
       ""
     );
   });
-
-  lines.push(
-    "Before recreating: confirm event identity, kickoff, market name, handicap/total line,",
-    "selection wording, settlement rules, current odds, and ticket acceptance.",
-    "No destination code has been requested or generated."
-  );
   preparedTicketText = lines.join("\n");
   output.textContent = preparedTicketText;
-
-  const cards = [
-    ["Selections to review", data.legs.length],
-    ["Legs with ambiguous source details", needsVerification],
-    ["Destination matching", "Not verified"]
-  ];
-  cards.forEach(([label,value]) => {
-    const card = el("div", "", $("converterSummary"), "stat");
-    el("span", label, card);
-    el("strong", value, card);
-  });
-
-  message.textContent = sameSource
-    ? "Prepared source-ticket checklist. Recreating at the same bookmaker still requires checking current markets and odds."
-    : "Manual reconstruction checklist prepared for " + destinationName + ". Destination equivalence is not verified.";
+  message.textContent = "Manual reconstruction checklist prepared for " + destinationName + ".";
   message.className = "warning";
 }
 
@@ -1419,12 +1542,11 @@ async function copyConvertedTicket() {
     return;
   }
   try {
-    if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error("Clipboard unavailable");
     await navigator.clipboard.writeText(preparedTicketText);
     message.textContent = "Prepared ticket copied to clipboard.";
     message.className = "success";
   } catch (_) {
-    message.textContent = "Automatic copy is unavailable in this browser. Long-press the text, select it, and copy manually.";
+    message.textContent = "Clipboard unavailable.";
     message.className = "warning";
   }
 }
@@ -1442,23 +1564,7 @@ function renderHealth(items) {
   renderList("sourceHealth", items, (item,parent) => {
     const card = el("div", "", parent, "item");
     el("strong", item.bookmaker + " — " + item.status, card);
-    el("p", item.detail || "No diagnostic detail available.", card, "small");
-    const parts = [
-      "HTTP: " + (item.http_status ?? "not reached"),
-      "Content-Type: " + (item.content_type || "unknown"),
-      "Response: " + (item.response_bytes ?? 0) + " bytes",
-      "Fetch: " + (item.fetch_ms ?? 0) + " ms",
-      "JSON: " + (item.json_valid ? "valid" : "no/invalid"),
-      "Schema: " + (item.schema_valid ? "recognized" : "not confirmed"),
-      "Events: " + (item.raw_events ?? 0) + " received / " + (item.events_loaded ?? 0) + " usable / " + (item.events_rejected ?? 0) + " rejected"
-    ];
-    el("p", parts.join(" · "), card, "small");
-    if (item.last_successful_fetch) el("p", "Last successful JSON fetch: " + item.last_successful_fetch, card, "small");
-    if (item.data_updated_at) el("p", "Newest event timestamp: " + item.data_updated_at + " · age " + item.freshness_seconds + " seconds" + (item.stale ? " · STALE" : ""), card, item.stale ? "warning" : "small");
-    else el("p", "Data freshness: unknown (no usable updated_at timestamp)", card, "small");
-    const reasons = item.rejection_reasons || {};
-    const reasonText = Object.entries(reasons).map(([reason,count]) => reason + ": " + count).join("; ");
-    if (reasonText) el("p", "Rejected-event reasons: " + reasonText, card, "small");
+    el("p", item.detail || "No diagnostic detail.", card, "small");
   }, "No source health data.");
 }
 
@@ -1473,10 +1579,10 @@ async function scan() {
     renderHealth(data.bookmakers);
     const summary = $("scanSummary");
     [
-      ["Usable two-outcome markets",data.usable_two_outcome_markets],
-      ["Arbitrage opportunities",data.arbitrage_count],
-      ["Selections at/above threshold",data.qualified_selections_count],
-      ["Alternative candidates",data.alternative_markets_count]
+      ["Usable markets", data.usable_markets],
+      ["2-outcome markets", data.usable_two_outcome_markets],
+      ["3-outcome markets", data.usable_three_outcome_markets],
+      ["Arbitrage opportunities", data.arbitrage_count]
     ].forEach(([label,value]) => {
       const stat = el("div", "", summary, "stat");
       el("span", label, stat);
@@ -1486,33 +1592,10 @@ async function scan() {
     renderList("arbitrage", data.arbitrage, (item,parent) => {
       const card = el("div", "", parent, "item");
       el("h3", item.event + " · " + item.sport, card);
-      el("p", "Market: " + item.market, card);
+      el("p", "Market: " + item.market + " (" + item.outcome_count + " outcomes)", card);
       el("p", "Theoretical margin: " + money(item.theoretical_margin_percent) + "%", card, "success");
-      el("p", "Implied probability sum: " + money(item.implied_probability_sum) + "%", card);
-      item.legs.forEach(leg => el("p",
-        leg.selection + ": " + leg.bookmaker + " @ " + money(leg.odds) +
-        " · suggested stake share " + money(leg.stake_fraction * 100) + "%",
-        card));
-      el("p", item.warning, card, "small");
-    }, "No qualifying arbitrage opportunity found in currently available feeds. Unavailable feeds are not proof that no arbitrage exists.");
-
-    renderList("probabilities", data.qualified_selections, (item,parent) => {
-      const card = el("div", "", parent, "item");
-      el("strong", item.event, card);
-      el("p", item.market + " · " + item.selection, card);
-      el("p", item.bookmaker + " @ " + money(item.odds), card);
-      el("p", "Feed-estimated probability: " + money(item.estimated_probability * 100) + "%", card);
-      el("p", item.evidence, card, "small");
-    }, "No feed-provided estimates reached the configured probability threshold. Odds alone are not treated as a model prediction.");
-
-    renderList("alternatives", data.alternative_markets, (item,parent) => {
-      const card = el("div", "", parent, "item");
-      el("strong", item.event, card);
-      el("p", item.market + " · " + item.selection, card);
-      el("p", item.bookmaker + " @ " + money(item.odds), card);
-      el("p", "Feed-estimated probability: " + money(item.estimated_probability * 100) + "%", card);
-      el("p", item.note, card, "small");
-    }, "No qualifying Over/Under, Double Chance, or Corners alternatives are available from configured feeds.");
+      item.legs.forEach(leg => el("p", leg.selection + ": " + leg.bookmaker + " @ " + money(leg.odds), card));
+    }, "No qualifying arbitrage opportunity found.");
   } catch (err) {
     $("scanMessage").textContent = err.message;
     $("scanMessage").className = "error";
@@ -1524,18 +1607,13 @@ async function scan() {
 async function loadHealth() {
   try {
     const data = await api("/health");
-    $("health").textContent =
-      "Service online · " + data.configured_feeds +
-      " configured odds feeds · SportyBet lookup adapter available";
+    $("health").textContent = "Service online · " + data.configured_feeds + " configured feeds";
     if (data.feed_status) renderHealth(data.feed_status);
   } catch (_) {
     $("health").textContent = "Could not check service status.";
   }
 }
 
-$("code").addEventListener("keydown", event => {
-  if (event.key === "Enter") lookup();
-});
 loadHealth();
 </script>
 </body>
@@ -1547,10 +1625,9 @@ loadHealth();
 # ---------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SolveEase/3.3"
+    server_version = "SolveEase/3.5"
 
     def log_message(self, fmt, *args):
-        # Avoid logging query strings, POST bodies, and booking codes.
         safe_message = fmt.split('"')[0].strip()
         logging.info("%s - %s", self.address_string(), safe_message)
 
@@ -1588,11 +1665,23 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("Request body must be valid JSON")
 
     def do_HEAD(self):
-        path = urlsplit(self.path).path
+        path = urlsplit(self.path).path.rstrip("/") or "/"
+
         if path == "/":
-            self.send_bytes(200, HTML.encode("utf-8"), "text/html; charset=utf-8")
-        else:
+            self.send_bytes(
+                200, HTML.encode("utf-8"),
+                "text/html; charset=utf-8"
+            )
+            return
+
+        if path == "/health":
             self.send_json(200, {"status": "online"})
+            return
+
+        self.send_json(404, {
+            "ok": False,
+            "error": "Route not found",
+        })
 
     def do_GET(self):
         path = urlsplit(self.path).path.rstrip("/") or "/"
@@ -1614,24 +1703,16 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "bookmaker": config["name"],
                     "status": "not tested" if config["feed_url"] else "not configured",
-                    "detail": "URL is configured but no scan has tested it in this process" if config["feed_url"] else "No feed URL configured",
-                    "http_status": None, "content_type": None, "response_bytes": 0,
-                    "fetch_ms": 0, "json_valid": False, "schema_valid": False,
-                    "raw_events": 0, "events_loaded": 0, "events_rejected": 0,
-                    "last_successful_fetch": None, "data_updated_at": None,
-                    "freshness_seconds": None, "stale": None,
+                    "detail": "URL configured but not scanned" if config["feed_url"] else "No feed URL configured",
                 }
                 for config in BOOKMAKERS.values()
             ]
             self.send_json(200, {
                 "status": "online",
                 "service": "SolveEase Booking & Arbitrage Dashboard",
-                "version": "3.3",
+                "version": "3.5",
                 "configured_feeds": configured,
                 "feed_status": feed_status,
-                "feed_freshness_threshold_seconds": STALE_AFTER_SECONDS,
-                "feed_status_note": "Configured does not mean tested; HTTP success does not prove official source authenticity or accurate live odds.",
-                "ticket_lookup_adapters": {"sportybet": "available", "bet9ja": "not implemented", "betking": "not implemented"},
                 "last_scan": last_scan,
                 "last_lookup": last_lookup,
                 "uptime_seconds": int(time.time() - STARTED_AT),
@@ -1662,10 +1743,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, result)
             except Exception:
                 logging.exception("Scan failed")
-                self.send_json(500, {
-                    "ok": False,
-                    "error": "Scan failed. Check configured feed schemas and service logs.",
-                })
+                self.send_json(500, {"ok": False, "error": "Scan failed."})
             return
 
         code = body.get("code", "")
@@ -1678,8 +1756,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(400, {"ok": False, "error": "Invalid booking code"})
             return
 
-        # Only SportyBet lookup is implemented. In auto mode, a successful
-        # lookup confirms the source; code format alone never does.
         if bookmaker in ("auto", "sportybet"):
             try:
                 result = lookup_sportybet(code)
@@ -1693,18 +1769,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(502, {
                     "ok": False,
                     "error": result.get("error", "SportyBet lookup failed"),
-                    "bookmaker_identification": "Not confirmed. Code format alone is insufficient.",
                 })
             return
 
         if bookmaker in ("bet9ja", "betking"):
             self.send_json(501, {
                 "ok": False,
-                "error": (
-                    "A verified lookup adapter is not configured for this bookmaker. "
-                    "The dashboard will not guess its booking-code format."
-                ),
-                "bookmaker_identification": "Not confirmed",
+                "error": "A verified lookup adapter is not configured for this bookmaker.",
             })
             return
 
@@ -1712,16 +1783,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    if not math.isfinite(TIMEOUT) or TIMEOUT <= 0:
-        raise ValueError("REQUEST_TIMEOUT_SECONDS must be positive")
-    if not math.isfinite(MIN_PROBABILITY) or not 0 <= MIN_PROBABILITY <= 1:
-        raise ValueError("MIN_PROBABILITY must be between 0 and 1")
-    if not math.isfinite(BANKROLL) or BANKROLL < 0:
-        raise ValueError("BANKROLL must be non-negative")
-
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
-    logging.info("SolveEase dashboard v3.3 listening on port %s", PORT)
+    logging.info("SolveEase dashboard v3.5 listening on port %s", PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
