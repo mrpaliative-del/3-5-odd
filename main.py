@@ -91,6 +91,24 @@ def find_outcomes(payload):
     return []
 
 
+def inspect_ticket_data(legs):
+    """Summarize data quality without guessing missing values."""
+    total = len(legs)
+    odds_found = sum(
+        1 for leg in legs
+        if isinstance(leg.get("odds"), (int, float))
+        and math.isfinite(leg["odds"])
+        and leg["odds"] > 1
+    )
+
+    return {
+        "selections_found": total,
+        "selections_with_odds": odds_found,
+        "selections_missing_odds": total - odds_found,
+        "combined_odds_calculable": total > 0 and odds_found == total,
+    }
+
+
 def first_value(obj, keys, default=""):
     """Return the first non-empty matching field."""
 
@@ -339,6 +357,13 @@ def lookup_sportybet(booking_code):
             "error": "The response did not contain usable selections.",
         }
 
+    diagnostics = inspect_ticket_data(legs)
+
+    logging.info(
+        "Ticket data quality: %s",
+        json.dumps(diagnostics),
+    )
+
     known_odds = [
         leg["odds"] for leg in legs
         if isinstance(leg["odds"], (int, float))
@@ -357,6 +382,7 @@ def lookup_sportybet(booking_code):
         "selections_count": len(legs),
         "legs": legs,
         "combined_odds": combined_odds,
+        "diagnostics": diagnostics,
         "status": ticket_fields.get("status", "Not provided"),
         "stake": ticket_fields.get("stake"),
         "potential_return": ticket_fields.get("potential_return"),
@@ -573,7 +599,12 @@ function renderTicket(data) {
 
   document.getElementById("combined").textContent =
     data.combined_odds == null
-      ? "Unavailable"
+      ? (
+          data.diagnostics
+            ? data.diagnostics.selections_with_odds + " of " +
+              data.diagnostics.selections_found + " odds found"
+            : "Unavailable"
+        )
       : Number(data.combined_odds).toFixed(2);
 
   document.getElementById("status").textContent =
