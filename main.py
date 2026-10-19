@@ -2,7 +2,7 @@
 """
 SolveEase Booking & Arbitrage Dashboard
 Python standard library only.
-Version: 3.7.0
+Version: 3.7.1
 
 Render start command:
     python main.py
@@ -1748,17 +1748,17 @@ HTML = r"""<!doctype html>
 <meta name="description" content="SolveEase bookmaker lookup, ticket reconstruction and arbitrage dashboard">
 <title>SolveEase | Booking & Arbitrage Dashboard</title>
 <style>
-:root{color-scheme:dark;--bg:#0b1220;--panel:#121d30;--panel2:#18263c;--text:#eef4ff;--muted:#9eb0ca;--line:#2b3b54;--accent:#69d7ac;--danger:#ff8585;--warning:#ffd479}
+:root{color-scheme:dark;--bg:#080f1c;--panel:#101b2d;--panel2:#16243a;--text:#edf3ff;--muted:#9aabc4;--line:#263750;--accent:#71e0b4;--danger:#ff8585;--warning:#ffd479;--blue:#8db8ff}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,sans-serif}
-main{width:min(1060px,100%);margin:auto;padding:20px 14px 44px}
-header{margin:8px 0 20px}.brand{color:var(--accent);font-weight:850;letter-spacing:.8px;font-size:13px}
+main{width:min(1180px,100%);margin:auto;padding:22px 16px 48px}
+header{margin:8px 0 18px;padding:8px 2px}.brand{color:var(--accent);font-weight:850;letter-spacing:1.5px;font-size:12px}
 h1{font-size:clamp(27px,5vw,40px);line-height:1.15;margin:8px 0}
 h2{font-size:21px;margin:0 0 10px}h3{font-size:16px;margin:0 0 6px}
-p{color:var(--muted)}.panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:17px;margin:14px 0}
+p{color:var(--muted)}.panel{background:linear-gradient(180deg,rgba(19,32,52,.98),rgba(15,26,43,.98));border:1px solid var(--line);border-radius:16px;padding:18px;margin:14px 0;box-shadow:0 8px 26px rgba(0,0,0,.12)}
 label{display:block;font-weight:650;margin:10px 0 6px}
 input,select{width:100%;min-height:48px;padding:12px;border-radius:10px;border:1px solid var(--line);background:#09101d;color:var(--text);font-size:16px}
-button{min-height:48px;padding:12px 16px;border:0;border-radius:10px;background:var(--accent);color:#071b15;font-weight:800;font-size:15px;cursor:pointer}
+button{min-height:46px;padding:11px 16px;border:0;border-radius:10px;background:var(--accent);color:#071b15;font-weight:800;font-size:14px;cursor:pointer;transition:transform .15s ease,filter .15s ease}button:hover{filter:brightness(1.05);transform:translateY(-1px)}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
 button:disabled{opacity:.55;cursor:wait}
 .actions{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:9px;margin-top:12px}
 .secondary{background:var(--panel2);color:var(--text);border:1px solid var(--line)}
@@ -1771,14 +1771,14 @@ button:disabled{opacity:.55;cursor:wait}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}
 .notice{border-left:3px solid var(--warning);padding-left:11px}
 footer{font-size:12px;color:var(--muted);margin-top:24px}
-.nav{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0 22px}
-.nav a,.feature-link{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;color:var(--text);background:var(--panel2);border:1px solid var(--line);border-radius:11px;padding:11px 14px;font-weight:750;min-height:44px}
+.nav{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0 22px;padding:7px;background:#0d1727;border:1px solid var(--line);border-radius:14px;position:sticky;top:6px;z-index:5;backdrop-filter:blur(12px)}
+.nav a,.feature-link{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;color:var(--text);background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 13px;font-weight:750;font-size:14px;min-height:42px}
 .nav a[aria-current="page"]{background:var(--accent);color:#071b15;border-color:var(--accent)}
-.hero{padding:22px;background:linear-gradient(135deg,#162a40,#101827);border:1px solid var(--line);border-radius:18px;margin:14px 0 18px}
+.hero{padding:clamp(20px,4vw,34px);background:radial-gradient(circle at 90% 10%,rgba(113,224,180,.12),transparent 34%),linear-gradient(135deg,#172b43,#101827);border:1px solid var(--line);border-radius:18px;margin:14px 0 18px}
 .hero p{max-width:680px}.feature-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
 .feature-card{display:flex;flex-direction:column;gap:8px;padding:17px;background:var(--panel);border:1px solid var(--line);border-radius:15px;min-height:180px}
 .feature-card p{margin:0;flex:1}.feature-card h2{font-size:18px}.feature-link{align-self:flex-start;background:var(--accent);color:#071b15}
-.page-section{display:none}.page-section:not(.page-hidden){display:block}.page-hidden{display:none!important}.eyebrow{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);font-weight:800}
+.page-section{display:none}.page-section:not(.page-hidden){display:block;animation:pageIn .18s ease-out}.page-hidden{display:none!important}.eyebrow{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);font-weight:800}.page-title{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}.page-title p{max-width:760px;margin-top:6px}.compact-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.summary-card{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:14px}.summary-card strong{display:block;font-size:18px}.summary-card span{color:var(--muted);font-size:12px}.subnav{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}.subnav a{color:var(--blue);font-size:13px;text-decoration:none;font-weight:750}.report-details{margin-top:12px;border:1px solid var(--line);border-radius:10px;padding:11px 13px;background:rgba(9,16,29,.45)}.report-details summary{cursor:pointer;font-weight:750;color:var(--blue)}@keyframes pageIn{from{opacity:.7;transform:translateY(3px)}to{opacity:1;transform:translateY(0)}}
 @media(min-width:760px){.two-col{display:grid;grid-template-columns:1fr 1fr;gap:14px}.two-col .panel{margin:0}}
 </style>
 </head>
@@ -1787,13 +1787,15 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
 <header>
   <div class="brand">SOLVEEASE · BOOKING TOOLS</div>
   <h1>Booking & Arbitrage Dashboard</h1>
-  <p>Read-only ticket lookup, manual ticket reconstruction, odds comparison and probability filters.</p>
+  <p>One workspace per task: retrieve a ticket, compare markets, review concise recommendations, and check accumulator maths.</p>
 </header>
 <nav class="nav" aria-label="Main navigation">
   <a href="/" data-page="home">Home</a>
   <a href="/lookup" data-page="lookup">Booking lookup</a>
   <a href="/converter" data-page="converter">Ticket converter</a>
-  <a href="/scanner" data-page="scanner">Arbitrage scanner</a>
+  <a href="/scanner" data-page="scanner">Market scanner</a>
+  <a href="/recommendations" data-page="recommendations">Recommendations</a>
+  <a href="/accumulator" data-page="accumulator">Accumulator</a>
   <a href="/status" data-page="status">Feed status</a>
 </nav>
 
@@ -1802,12 +1804,14 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
     <div class="eyebrow">SolveEase · Control centre</div>
     <h1>Choose a tool. Get a dedicated workspace.</h1>
     <p>Each tool opens on its own page, with a direct URL and consistent navigation. This dashboard is read-only: it does not place bets or invent booking codes.</p>
-    <div class="actions"><a class="feature-link" href="/scanner">Open arbitrage scanner</a><a class="feature-link" href="/lookup">Look up a ticket</a></div>
+    <div class="actions"><a class="feature-link" href="/lookup">Look up a ticket →</a><a class="feature-link" href="/recommendations">Review recommendations →</a><a class="feature-link" href="/scanner">Scan markets →</a></div>
   </div>
   <div class="feature-grid">
     <article class="feature-card"><div class="eyebrow">01 · Tickets</div><h2>Booking-code lookup</h2><p>Retrieve supported ticket details and review selection counts and odds diagnostics.</p><a class="feature-link" href="/lookup">Open lookup →</a></article>
     <article class="feature-card"><div class="eyebrow">02 · Tickets</div><h2>Ticket converter</h2><p>Prepare a structured checklist to recreate a retrieved ticket manually at another bookmaker.</p><a class="feature-link" href="/converter">Open converter →</a></article>
-    <article class="feature-card"><div class="eyebrow">03 · Markets</div><h2>Arbitrage scanner</h2><p>Compare matching two-outcome markets, show qualifying margins, and inspect feed-based probability candidates.</p><a class="feature-link" href="/scanner">Open scanner →</a></article>
+    <article class="feature-card"><div class="eyebrow">03 · Markets</div><h2>Market scanner</h2><p>Check configured odds feeds and inspect usable market prices.</p><a class="feature-link" href="/scanner">Open scanner →</a></article>
+    <article class="feature-card"><div class="eyebrow">04 · Analysis</div><h2>Recommendations</h2><p>Compare candidate markets and review concise probability and data-quality summaries.</p><a class="feature-link" href="/recommendations">Open recommendations →</a></article>
+    <article class="feature-card"><div class="eyebrow">05 · Tickets</div><h2>Accumulator calculator</h2><p>Review combined odds and potential returns without mixing ticket maths with win predictions.</p><a class="feature-link" href="/accumulator">Open calculator →</a></article>
     <article class="feature-card"><div class="eyebrow">04 · Monitoring</div><h2>Feed and service status</h2><p>Inspect configured feeds, response health, freshness and the last scan report.</p><a class="feature-link" href="/status">Open status →</a></article>
   </div>
   <section class="panel"><h2>System snapshot</h2><div id="homeHealth">Checking service…</div><p class="small">A service being online does not mean every feed is configured, usable or current.</p></section>
@@ -1847,7 +1851,8 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
 </section>
 
 <section class="panel page-section" id="scannerPanel">
-  <h2>3. Arbitrage scanner</h2>
+  <div class="page-title"><div><div class="eyebrow">Market intelligence</div><h2>Market scanner</h2><p>Scan available odds feeds and inspect usable markets. Detailed recommendations and accumulator maths have their own workspaces.</p></div></div>
+  <div class="subnav"><a href="/recommendations">Go to recommendations →</a><a href="/accumulator">Open accumulator calculator →</a><a href="/status">Check feed health →</a></div>
   <p>Scans only the permitted JSON odds feeds configured on the server. Missing feeds are reported as unavailable, not as proof that no opportunity exists.</p>
   <div class="actions">
     <button id="scanBtn" onclick="scan()">Scan bookmakers now</button>
@@ -1862,6 +1867,19 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
     <div id="marketCatalogNote" class="small" role="status" aria-live="polite">Run a scan to load available markets.</div>
     <div id="marketCatalog"></div>
   </section>
+  <h3>Arbitrage opportunities</h3><div id="arbitrage"></div>
+  <h3>Probability filter</h3>
+  <p class="small">Default threshold: 60%. Uses estimates supplied by the configured feed, not odds-implied probabilities.</p>
+  <div id="probabilities"></div>
+  <h3>Preferred alternative markets</h3>
+  <p class="small">Priorities include Over/Under, Double Chance and Corners where supported by feed data.</p>
+  <div id="alternatives"></div>
+</section>
+
+<section class="panel page-section page-hidden" id="recommendationsPanel">
+  <div class="eyebrow">Decision support</div><h2>Market recommendations</h2>
+  <p>Review candidate markets for selected fixtures. The report is intentionally concise; open the supporting details only when needed. Recommendations require usable odds and sufficient historical data.</p>
+  <div class="subnav"><a href="/lookup">← Booking lookup</a><a href="/scanner">Scan bookmaker markets →</a><a href="/accumulator">Accumulator calculator →</a></div>
   <section class="panel" aria-labelledby="betslipAnalysisTitle">
     <h3 id="betslipAnalysisTitle">Selected betslip market analysis</h3>
     <p class="small">Paste selected legs as JSON. Goal-rate fields are optional: the engine tries automatic historical team-stat lookup when they are omitted. Supported markets: 1X2, double chance, totals with a line, and both-teams-to-score.</p>
@@ -1875,8 +1893,14 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
     <div class="actions"><button type="button" id="analyzeBetslipBtn" onclick="analyzeBetslip()">Analyze selected markets</button><button type="button" class="secondary" onclick="clearBetslipAnalysis()">Clear analysis</button></div>
     <div id="betslipAnalysisMessage" role="status" aria-live="polite"></div>
     <div id="betslipAnalysisReport"></div>
-    <p class="small notice">Model estimates are not verified forecasts. Do not interpret a positive estimated edge as proof of value or profit. Confirm market settlement rules and current odds independently.</p>
+    <p class="small notice">Summary first: compare recommended market, estimated probability, odds and data quality. Model estimates are not verified forecasts; confirm settlement rules and live prices independently.</p>
   </section>
+</section>
+
+<section class="panel page-section page-hidden" id="accumulatorPanel">
+  <div class="eyebrow">Ticket maths</div><h2>Accumulator calculator</h2>
+  <p>Check combined odds and potential returns. This calculator does not estimate the probability that the full accumulator wins.</p>
+  <div class="subnav"><a href="/recommendations">← Review recommendations</a><a href="/scanner">Scan markets →</a></div>
   <section class="panel" aria-labelledby="accumulatorTitle">
     <h3 id="accumulatorTitle">Accumulator calculator & report</h3>
     <p class="small">Enter one selection per line as <code>Selection label | decimal odds</code>. This calculates the ticket maths only; it does not estimate whether the selections will win.</p>
@@ -1888,13 +1912,6 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
     <div id="accumulatorMessage" role="status" aria-live="polite"></div>
     <div id="accumulatorReport"></div>
   </section>
-  <h3>Arbitrage opportunities</h3><div id="arbitrage"></div>
-  <h3>Probability filter</h3>
-  <p class="small">Default threshold: 60%. Uses estimates supplied by the configured feed, not odds-implied probabilities.</p>
-  <div id="probabilities"></div>
-  <h3>Preferred alternative markets</h3>
-  <p class="small">Priorities include Over/Under, Double Chance and Corners where supported by feed data.</p>
-  <div id="alternatives"></div>
 </section>
 
 <section class="panel page-section" id="statusPanel">
@@ -1911,17 +1928,37 @@ const $ = id => document.getElementById(id);
 let lastLookupData = null;
 let preparedTicketText = "";
 
+// Keep in-progress workspace inputs when the user follows a dedicated page link.
+// Values are session-only and stay in this browser tab.
+function persistWorkspace() {
+  try {
+    ["betslipJson", "accumulatorLegs", "accumulatorStake"].forEach(id => {
+      const node = $(id);
+      if (node) sessionStorage.setItem("solveease:workspace:" + id, node.value);
+    });
+  } catch (_) { /* Storage can be disabled; the app remains usable. */ }
+}
+function restoreWorkspace() {
+  try {
+    ["betslipJson", "accumulatorLegs", "accumulatorStake"].forEach(id => {
+      const node = $(id);
+      const saved = sessionStorage.getItem("solveease:workspace:" + id);
+      if (node && saved !== null) node.value = saved;
+    });
+  } catch (_) { /* Storage can be disabled; the app remains usable. */ }
+}
 function activatePage() {
+  restoreWorkspace();
   const raw = location.pathname.replace(/\/$/, "") || "/";
-  const page = ({"/":"home","/lookup":"lookup","/converter":"converter","/scanner":"scanner","/status":"status"})[raw];
+  const page = ({"/":"home","/lookup":"lookup","/converter":"converter","/scanner":"scanner","/recommendations":"recommendations","/accumulator":"accumulator","/status":"status"})[raw];
   if (!page) { location.replace("/"); return; }
-  const map = {home:"homePage",lookup:"lookupPanel",converter:"converterPanel",scanner:"scannerPanel",status:"statusPanel"};
+  const map = {home:"homePage",lookup:"lookupPanel",converter:"converterPanel",scanner:"scannerPanel",recommendations:"recommendationsPanel",accumulator:"accumulatorPanel",status:"statusPanel"};
   Object.entries(map).forEach(([key,id]) => $(id).classList.toggle("page-hidden", key !== page));
   document.querySelectorAll(".nav a").forEach(a => {
     if (a.dataset.page === page) a.setAttribute("aria-current","page");
     else a.removeAttribute("aria-current");
   });
-  const titles = {home:"Home",lookup:"Booking-code lookup",converter:"Ticket converter",scanner:"Arbitrage scanner",status:"Feed and service status"};
+  const titles = {home:"Home",lookup:"Booking-code lookup",converter:"Ticket converter",scanner:"Market scanner",recommendations:"Market recommendations",accumulator:"Accumulator calculator",status:"Feed and service status"};
   document.title = "SolveEase | " + titles[page];
   if (page === "home" || page === "status") loadHealth();
   if (page === "converter") restoreLookup();
@@ -2504,6 +2541,11 @@ async function loadHealth() {
 $("code").addEventListener("keydown", event => {
   if (event.key === "Enter") lookup();
 });
+["betslipJson", "accumulatorLegs", "accumulatorStake"].forEach(id => {
+  const node = $(id);
+  if (node) node.addEventListener("input", persistWorkspace);
+});
+window.addEventListener("pagehide", persistWorkspace);
 activatePage();
 </script>
 </body>
@@ -2515,7 +2557,7 @@ activatePage();
 # ---------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SolveEase/3.6.0"
+    server_version = "SolveEase/3.7.1"
 
     def log_message(self, fmt, *args):
         # Avoid logging query strings, POST bodies, and booking codes.
@@ -2557,14 +2599,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         path = urlsplit(self.path).path
-        if path.rstrip("/") in ("", "/lookup", "/converter", "/scanner", "/status"):
+        if path.rstrip("/") in ("", "/lookup", "/converter", "/scanner", "/recommendations", "/accumulator", "/status"):
             self.send_bytes(200, HTML.encode("utf-8"), "text/html; charset=utf-8")
         else:
             self.send_json(200, {"status": "online"})
 
     def do_GET(self):
         path = urlsplit(self.path).path.rstrip("/") or "/"
-        if path in ("/", "/lookup", "/converter", "/scanner", "/status"):
+        if path in ("/", "/lookup", "/converter", "/scanner", "/recommendations", "/accumulator", "/status"):
             self.send_bytes(200, HTML.encode("utf-8"), "text/html; charset=utf-8")
             return
         if path == "/favicon.ico":
@@ -2594,7 +2636,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "status": "online",
                 "service": "SolveEase Booking & Arbitrage Dashboard",
-                "version": "3.7.0",
+                "version": "3.7.1",
                 "configured_feeds": configured,
                 "feed_status": feed_status,
                 "feed_freshness_threshold_seconds": STALE_AFTER_SECONDS,
@@ -2714,7 +2756,7 @@ def main():
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
-    logging.info("SolveEase Booking & Arbitrage Dashboard v3.7.0 listening on port %s", PORT)
+    logging.info("SolveEase Booking & Arbitrage Dashboard v3.7.1 listening on port %s", PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

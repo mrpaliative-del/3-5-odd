@@ -1,4 +1,4 @@
-# Verification record for SolveEase v3.7.0
+# Verification record for SolveEase v3.7.1
 
 The package was tested locally with synthetic fixtures and mocked statistical-provider responses. These checks verify implementation behavior, not live source reachability, model calibration, or betting profitability. Outbound DNS/network access was unavailable in the packaging environment, so live Football-Data.co.uk and Understat requests could not be confirmed.
 
@@ -27,3 +27,11 @@ The package was tested locally with synthetic fixtures and mocked statistical-pr
 - The Poisson model is not trained/calibrated. Estimated edge is not proof of value. No combined accumulator win probability is claimed.
 - If team matching or data coverage fails, the system returns no model probability rather than fabricating one. The original ticket is preserved and no bet is placed.
 - Football-Data.co.uk states that its free downloads are for private individual use; check current permissions before commercial reuse.
+
+
+## v3.7.1 interface regression checks
+
+- Added dedicated `/recommendations` and `/accumulator` routes.
+- Added both routes to GET and HEAD route allowlists and page activation map.
+- Split market recommendations and accumulator maths from the scanner page.
+- Retained the existing statistical engine and existing 25 unit tests; no claim is made that this UI update validates live odds or live statistics sources.

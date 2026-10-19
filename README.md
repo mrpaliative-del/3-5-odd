@@ -1,4 +1,4 @@
-# SolveEase Booking & Arbitrage Dashboard v3.7.0
+# SolveEase Booking & Arbitrage Dashboard v3.7.1
 
 A mobile-friendly, read-only football odds dashboard using **Python standard library only**. No third-party Python packages are required. It does not log in to bookmakers or place bets.
 
@@ -115,6 +115,13 @@ Arbitrage results are theoretical. Verify exact event, line, market settlement, 
 Run the tests locally with `python -m unittest -v`. Tests use synthetic fixtures and mathematical examples; they verify code behavior, not live bookmaker access or betting profitability. Live feeds have not been confirmed by this package. After deployment, inspect `/health` and the scan diagnostics to establish which configured sources actually respond and provide usable data.
 
 
+
+## v3.7.1 interface improvements
+
+- Dedicated routes for Home, Booking lookup, Ticket converter, Market scanner, Market recommendations, Accumulator calculator, and Feed status.
+- Separate recommendation and accumulator workspaces so the scanner no longer holds every task on one long page.
+- Clear cross-navigation links, active-page state, compact mobile-first styling, keyboard focus indicators, and concise statistical-analysis guidance.
+- The analysis model and source limitations remain unchanged; UI separation does not itself improve probability accuracy or market-feed coverage.
 
 ## v3.7.0 automatic team-stat analysis
 
