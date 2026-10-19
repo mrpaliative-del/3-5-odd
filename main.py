@@ -2,7 +2,7 @@
 """
 SolveEase Booking & Arbitrage Dashboard
 Python standard library only.
-Version: 3.6.0
+Version: 3.6.1
 
 Render start command:
     python main.py
@@ -176,22 +176,18 @@ def _selection_probability(market, selection, home_rate, away_rate):
         home_win = sum(prob for h, a, prob in scores if h > a)
         draw = sum(prob for h, a, prob in scores if h == a)
         away_win = sum(prob for h, a, prob in scores if h < a)
-        if selection_text in ("home", "home win", "1", "1x", "home or draw"):
-            if selection_text in ("1x", "home or draw") or "double chance" in market_text and selection_text in ("home/draw", "1x"):
-                return home_win + draw, "Independent-Poisson estimate for home-or-draw"
+        if selection_text in ("1x", "home/draw", "home draw", "home or draw"):
+            return home_win + draw, "Independent-Poisson estimate for home-or-draw"
+        if selection_text in ("x2", "draw/away", "draw away", "draw or away"):
+            return draw + away_win, "Independent-Poisson estimate for draw-or-away"
+        if selection_text in ("12", "home or away", "no draw"):
+            return home_win + away_win, "Independent-Poisson estimate for no draw"
+        if selection_text in ("home", "home win", "1"):
             return home_win, "Independent-Poisson estimate for home win"
         if selection_text in ("draw", "x"):
             return draw, "Independent-Poisson estimate for draw"
-        if selection_text in ("away", "away win", "2", "x2", "draw or away"):
-            if selection_text in ("x2", "draw or away"):
-                return draw + away_win, "Independent-Poisson estimate for draw-or-away"
+        if selection_text in ("away", "away win", "2"):
             return away_win, "Independent-Poisson estimate for away win"
-        if selection_text in ("12", "home or away", "no draw"):
-            return home_win + away_win, "Independent-Poisson estimate for no draw"
-        if selection_text in ("1x", "home/draw", "home or draw"):
-            return home_win + draw, "Independent-Poisson estimate for home-or-draw"
-        if selection_text in ("x2", "draw/away", "draw or away"):
-            return draw + away_win, "Independent-Poisson estimate for draw-or-away"
         return None, "Unsupported result selection label; use Home, Draw, Away, 1X, 12, or X2"
 
     # Market text needs an explicit numeric goal line to avoid guessing the line.
@@ -1269,6 +1265,18 @@ def run_scan():
         "qualified_selections": probabilities,
         "alternative_markets_count": len(alternatives),
         "alternative_markets": alternatives,
+        # A bounded catalog lets the mobile UI select real markets from the latest scan.
+        # Goal rates remain explicit user inputs; the scanner does not invent team statistics.
+        "available_markets_count": len(rows),
+        "available_markets": [
+            {
+                "sport": row["sport"], "event": row["event"], "market": row["market"],
+                "bookmaker": row["bookmaker"], "updated_at": row.get("updated_at"),
+                "outcomes": [{"name": outcome["name"], "odds": outcome["odds"]} for outcome in row["outcomes"]],
+            }
+            for row in rows[:250]
+        ],
+        "available_markets_truncated": len(rows) > 250,
         "notes": [
             "No opportunity is displayed unless configured feed data qualifies.",
             "A feed-provided probability estimate is not a guarantee.",
@@ -1414,6 +1422,12 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
   <div id="scanMessage" role="status" aria-live="polite"></div>
   <div id="sourceHealth"></div>
   <div id="scanSummary" class="grid"></div>
+  <section class="panel" aria-labelledby="marketCatalogTitle">
+    <h3 id="marketCatalogTitle">Markets from the latest scan</h3>
+    <p class="small">Choose an outcome from the latest usable feed markets. For model analysis, enter expected-goal rates from a credible source; these are not automatically inferred from odds.</p>
+    <div id="marketCatalogNote" class="small" role="status" aria-live="polite">Run a scan to load available markets.</div>
+    <div id="marketCatalog"></div>
+  </section>
   <section class="panel" aria-labelledby="betslipAnalysisTitle">
     <h3 id="betslipAnalysisTitle">Selected betslip market analysis</h3>
     <p class="small">Paste your selected legs as JSON. Enter expected-goal rates from a credible source; this tool does not fetch team statistics automatically. Supported markets: 1X2, double chance, totals with a line, and both-teams-to-score.</p>
@@ -1790,7 +1804,8 @@ async function scan() {
   $("scanBtn").disabled = true;
   $("scanMessage").textContent = "Fetching configured odds feeds…";
   $("scanMessage").className = "";
-  ["sourceHealth","scanSummary","arbitrage","probabilities","alternatives"].forEach(clear);
+  ["sourceHealth","scanSummary","arbitrage","probabilities","alternatives","marketCatalog"].forEach(clear);
+  $("marketCatalogNote").textContent = "Fetching market catalog…";
   try {
     const data = await api("/api/scan", "POST", {});
     $("scanMessage").textContent = "Scan completed at " + data.scanned_at;
@@ -1806,6 +1821,8 @@ async function scan() {
       el("span", label, stat);
       el("strong", value, stat);
     });
+
+    renderMarketCatalog(data.available_markets || [], data.available_markets_count || 0, !!data.available_markets_truncated);
 
     renderList("arbitrage", data.arbitrage, (item,parent) => {
       const card = el("div", "", parent, "item");
@@ -1843,6 +1860,57 @@ async function scan() {
   } finally {
     $("scanBtn").disabled = false;
   }
+}
+
+function renderMarketCatalog(markets, totalCount, truncated) {
+  const target = $("marketCatalog");
+  clear("marketCatalog");
+  const note = $("marketCatalogNote");
+  note.textContent = totalCount
+    ? ("Showing " + markets.length + " of " + totalCount + " usable two-outcome markets from this scan." + (truncated ? " Catalog limited to first 250 markets." : ""))
+    : "No usable markets are available from the configured feeds. A failed feed is not evidence that no opportunities exist.";
+  markets.forEach((market, index) => {
+    const card = el("div", "", target, "item");
+    el("strong", market.event, card);
+    el("p", market.market + " · " + market.bookmaker, card, "small");
+    const rates = el("div", "", card, "grid");
+    const homeWrap = el("label", "Home expected goals", rates);
+    const homeInput = el("input", "", homeWrap);
+    homeInput.type = "number"; homeInput.min = "0.05"; homeInput.max = "8"; homeInput.step = "0.05";
+    homeInput.placeholder = "e.g. 1.45"; homeInput.inputMode = "decimal"; homeInput.id = "homeRate_" + index;
+    const awayWrap = el("label", "Away expected goals", rates);
+    const awayInput = el("input", "", awayWrap);
+    awayInput.type = "number"; awayInput.min = "0.05"; awayInput.max = "8"; awayInput.step = "0.05";
+    awayInput.placeholder = "e.g. 1.10"; awayInput.inputMode = "decimal"; awayInput.id = "awayRate_" + index;
+    market.outcomes.forEach(outcome => {
+      const button = el("button", "", card);
+      button.type = "button";
+      button.textContent = "Add " + outcome.name + " @ " + outcome.odds;
+      button.addEventListener("click", () => addCatalogLeg(market, outcome, homeInput.value, awayInput.value));
+    });
+    el("p", "Use expected-goal inputs from a credible source. Do not enter guesses just to obtain a score.", card, "small notice");
+  });
+}
+
+function addCatalogLeg(market, outcome, homeRate, awayRate) {
+  const message = $("betslipAnalysisMessage");
+  const h = Number(homeRate), a = Number(awayRate);
+  if (!Number.isFinite(h) || !Number.isFinite(a) || h < 0.05 || h > 8 || a < 0.05 || a > 8) {
+    message.textContent = "Enter credible home and away expected-goal rates (0.05–8.00) before adding this selection.";
+    message.className = "warning";
+    return;
+  }
+  let payload;
+  try { payload = JSON.parse($("betslipJson").value || '{"legs":[]}'); }
+  catch (_) { payload = {legs: []}; }
+  if (!payload || !Array.isArray(payload.legs)) payload = {legs: []};
+  if (payload.legs.length >= 50) {
+    message.textContent = "Maximum 50 legs per analysis."; message.className = "warning"; return;
+  }
+  payload.legs.push({event: market.event, market: market.market, selection: outcome.name, odds: outcome.odds, home_goal_rate: h, away_goal_rate: a, bookmaker: market.bookmaker, updated_at: market.updated_at || null});
+  $("betslipJson").value = JSON.stringify(payload, null, 2);
+  message.textContent = "Added " + market.event + " — " + market.market + " — " + outcome.name + ". You can add more selections, then analyze the betslip below.";
+  message.className = "success";
 }
 
 async function analyzeBetslip() {
@@ -1992,7 +2060,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "status": "online",
                 "service": "SolveEase Booking & Arbitrage Dashboard",
-                "version": "3.6.0",
+                "version": "3.6.1",
                 "configured_feeds": configured,
                 "feed_status": feed_status,
                 "feed_freshness_threshold_seconds": STALE_AFTER_SECONDS,
@@ -2098,7 +2166,7 @@ def main():
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
-    logging.info("SolveEase Booking & Arbitrage Dashboard v3.6.0 listening on port %s", PORT)
+    logging.info("SolveEase Booking & Arbitrage Dashboard v3.6.1 listening on port %s", PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

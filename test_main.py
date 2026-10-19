@@ -154,6 +154,29 @@ class ScannerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             app.analyze_betslip({"legs": [{}] * 51})
 
+    def test_double_chance_home_draw_alias_includes_draw_probability(self):
+        home_draw, _ = app._selection_probability("Double Chance", "Home/Draw", 1.7, 0.9)
+        home_win, _ = app._selection_probability("1X2", "Home", 1.7, 0.9)
+        self.assertGreater(home_draw, home_win)
+
+    def test_scan_exposes_bounded_market_catalog_for_selection(self):
+        row = {
+            "bookmaker_key": "sportybet", "bookmaker": "SportyBet", "sport": "Football",
+            "event": "Alpha FC vs Beta FC", "event_key": "alpha fc vs beta fc",
+            "market": "Total Goals 2.5", "market_key": "total goals 2.5",
+            "updated_at": None, "outcomes": [
+                {"name": "Over 2.5", "name_key": "over 2.5", "odds": 2.1, "estimated_probability": None},
+                {"name": "Under 2.5", "name_key": "under 2.5", "odds": 1.9, "estimated_probability": None},
+            ],
+        }
+        health = [{"bookmaker": "SportyBet", "status": "usable markets", "events_loaded": 1}]
+        with patch.object(app, "fetch_all_feeds", return_value=([row], health)):
+            result = app.run_scan()
+        self.assertEqual(result["available_markets_count"], 1)
+        self.assertEqual(result["available_markets"][0]["event"], "Alpha FC vs Beta FC")
+        self.assertEqual(result["available_markets"][0]["outcomes"][0]["odds"], 2.1)
+        self.assertFalse(result["available_markets_truncated"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
