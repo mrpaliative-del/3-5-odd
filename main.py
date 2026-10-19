@@ -2,7 +2,7 @@
 """
 SolveEase Booking & Arbitrage Dashboard
 Python standard library only.
-Version: 3.5.0
+Version: 3.5.1
 
 Render start command:
     python main.py
@@ -1251,6 +1251,17 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
   <div id="scanMessage" role="status" aria-live="polite"></div>
   <div id="sourceHealth"></div>
   <div id="scanSummary" class="grid"></div>
+  <section class="panel" aria-labelledby="accumulatorTitle">
+    <h3 id="accumulatorTitle">Accumulator calculator & report</h3>
+    <p class="small">Enter one selection per line as <code>Selection label | decimal odds</code>. This calculates the ticket maths only; it does not estimate whether the selections will win.</p>
+    <label for="accumulatorLegs">Selections and decimal odds</label>
+    <textarea id="accumulatorLegs" rows="5" maxlength="6000" placeholder="Team A to win | 1.80&#10;Over 1.5 goals | 1.35&#10;Team C or draw | 1.50"></textarea>
+    <label for="accumulatorStake">Stake amount</label>
+    <input id="accumulatorStake" type="number" min="0.01" max="1000000000" step="0.01" value="1000" inputmode="decimal">
+    <div class="actions"><button type="button" onclick="analyzeAccumulator()">Calculate accumulator</button><button type="button" class="secondary" onclick="clearAccumulator()">Clear</button></div>
+    <div id="accumulatorMessage" role="status" aria-live="polite"></div>
+    <div id="accumulatorReport"></div>
+  </section>
   <h3>Arbitrage opportunities</h3><div id="arbitrage"></div>
   <h3>Probability filter</h3>
   <p class="small">Default threshold: 60%. Uses estimates supplied by the configured feed, not odds-implied probabilities.</p>
@@ -1306,6 +1317,69 @@ function el(tag, text, parent, cls) {
   return node;
 }
 function clear(id) { $(id).replaceChildren(); }
+function clearAccumulator() {
+  $("accumulatorLegs").value = "";
+  $("accumulatorStake").value = "1000";
+  $("accumulatorMessage").textContent = "";
+  $("accumulatorMessage").className = "";
+  clear("accumulatorReport");
+}
+function analyzeAccumulator() {
+  const raw = $("accumulatorLegs").value.trim();
+  const stake = Number($("accumulatorStake").value);
+  const message = $("accumulatorMessage");
+  const report = $("accumulatorReport");
+  clear("accumulatorReport");
+  message.className = "";
+  if (!raw) {
+    message.textContent = "Add at least one selection and decimal odd.";
+    message.className = "warning";
+    return;
+  }
+  if (!Number.isFinite(stake) || stake <= 0 || stake > 1000000000) {
+    message.textContent = "Enter a valid positive stake up to 1,000,000,000.";
+    message.className = "error";
+    return;
+  }
+  const lines = raw.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  if (lines.length > 30) {
+    message.textContent = "Maximum 30 selections per accumulator report.";
+    message.className = "error";
+    return;
+  }
+  const legs = [];
+  for (let i=0; i<lines.length; i++) {
+    const parts = lines[i].split("|");
+    const label = (parts.shift() || "").trim();
+    const oddText = parts.join("|").trim();
+    const odds = Number(oddText);
+    if (!label || label.length > 180 || !oddText || !Number.isFinite(odds) || odds <= 1 || odds > 1000) {
+      message.textContent = "Line " + (i+1) + " is invalid. Use Selection label | decimal odds greater than 1 and no more than 1000.";
+      message.className = "error";
+      return;
+    }
+    legs.push({label, odds});
+  }
+  const combined = legs.reduce((product, leg) => product * leg.odds, 1);
+  if (!Number.isFinite(combined) || combined <= 1) {
+    message.textContent = "Combined odds exceed the calculator's safe numeric range.";
+    message.className = "error";
+    return;
+  }
+  const gross = stake * combined;
+  const net = gross - stake;
+  const implied = 100 / combined;
+  const statGrid = el("div", "", report, "grid");
+  [["Selections", String(legs.length)], ["Combined decimal odds", combined.toLocaleString("en-US", {maximumFractionDigits:4})], ["Raw implied probability", implied.toFixed(4) + "%"], ["Potential gross return", money(gross)], ["Potential net profit", money(net)]].forEach(([label,value]) => {
+    const card = el("div", "", statGrid, "stat"); el("span", label, card); el("strong", value, card);
+  });
+  const list = el("div", "", report, "item");
+  el("strong", "Leg-by-leg audit", list);
+  legs.forEach((leg, index) => el("p", (index+1) + ". " + leg.label + " — odds " + leg.odds.toLocaleString("en-US", {maximumFractionDigits:4}) + " — individual raw implied probability " + (100/leg.odds).toFixed(2) + "%", list));
+  el("p", "These are arithmetic calculations from the odds you entered. The combined implied probability is not a calibrated forecast and does not account for bookmaker margin, correlation between legs, void rules, limits, price changes or settlement disputes. The stake can be lost in full.", report, "small notice");
+  message.textContent = "Calculation complete. No prediction or bet placement was performed.";
+  message.className = "success";
+}
 function money(value, digits=2) {
   if (value === null || value === undefined || value === "" || !Number.isFinite(Number(value))) return "Unavailable";
   return Number(value).toLocaleString("en-US", {minimumFractionDigits:digits,maximumFractionDigits:digits});
@@ -1602,7 +1676,8 @@ async function loadHealth() {
     if ($("homeHealth")) $("homeHealth").textContent = summary;
     if (data.feed_status && $("sourceHealth")) renderHealth(data.feed_status, $("statusFeedHealth") && !$("statusPanel").classList.contains("page-hidden") ? "statusFeedHealth" : "sourceHealth");
   } catch (_) {
-    $("health").textContent = "Could not check service status.";
+    if ($("health")) $("health").textContent = "Could not check service status.";
+    if ($("homeHealth")) $("homeHealth").textContent = "Could not check service status.";
   }
 }
 
@@ -1620,7 +1695,7 @@ activatePage();
 # ---------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SolveEase/3.4"
+    server_version = "SolveEase/3.5.1"
 
     def log_message(self, fmt, *args):
         # Avoid logging query strings, POST bodies, and booking codes.
@@ -1794,7 +1869,7 @@ def main():
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
-    logging.info("SolveEase Booking & Arbitrage Dashboard v3.5.0 listening on port %s", PORT)
+    logging.info("SolveEase Booking & Arbitrage Dashboard v3.5.1 listening on port %s", PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
