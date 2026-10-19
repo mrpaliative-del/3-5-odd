@@ -2,7 +2,7 @@
 """
 SolveEase Booking & Arbitrage Dashboard
 Python standard library only.
-Version: 3.8.5
+Version: 3.8.6
 
 Render start command:
     python main.py
@@ -91,7 +91,19 @@ FOOTBALL_CSV_CACHE = {}
 FOOTBALL_STATS_CACHE = {}
 UNDERSTAT_CACHE = {}
 UNDERSTAT_LEAGUES = {"E0":"EPL", "SP1":"La_Liga", "D1":"Bundesliga", "I1":"Serie_A", "F1":"Ligue_1"}
-FOOTBALL_DIVISIONS = {"E0":"England Premier League", "E1":"England Championship", "SC0":"Scotland Premiership", "D1":"Germany Bundesliga", "I1":"Italy Serie A", "SP1":"Spain La Liga", "F1":"France Ligue 1", "N1":"Netherlands Eredivisie", "B1":"Belgium First Division A", "P1":"Portugal Primeira Liga", "T1":"Turkey Super Lig", "G1":"Greece Super League"}
+# Wider European coverage. Availability still depends on the public archive publishing a
+# usable CSV for the requested season; configured does not mean live data was retrieved.
+FOOTBALL_DIVISIONS = {
+    "E0":"England Premier League", "E1":"England Championship", "E2":"England League One",
+    "E3":"England League Two", "E4":"England National League",
+    "SC0":"Scotland Premiership", "SC1":"Scotland Championship", "SC2":"Scotland League One", "SC3":"Scotland League Two",
+    "D1":"Germany Bundesliga", "D2":"Germany 2. Bundesliga",
+    "I1":"Italy Serie A", "I2":"Italy Serie B",
+    "SP1":"Spain La Liga", "SP2":"Spain Segunda Division",
+    "F1":"France Ligue 1", "F2":"France Ligue 2",
+    "N1":"Netherlands Eredivisie", "B1":"Belgium First Division A",
+    "P1":"Portugal Primeira Liga", "T1":"Turkey Super Lig", "G1":"Greece Super League"
+}
 
 SPORTYBET_SHARE_URL = "https://www.sportybet.com/api/ng/orders/share/"
 
@@ -182,9 +194,10 @@ def _selection_probability(market, selection, home_rate, away_rate):
     scores = [(h, a, hp * ap) for h, hp in enumerate(home) for a, ap in enumerate(away)]
     if any(term in market_text for term in ("both teams to score", "btts", "both teams score")):
         yes = sum(prob for h, a, prob in scores if h > 0 and a > 0)
-        if selection_text in ("yes", "btts yes", "both teams to score yes"):
+        compact_selection = re.sub(r"[^a-z0-9]+", "", selection_text)
+        if compact_selection in ("yes", "bttsyes", "bothteamstoscoreyes", "gg"):
             return yes, "Independent-Poisson estimate for both teams to score: yes"
-        if selection_text in ("no", "btts no", "both teams to score no"):
+        if compact_selection in ("no", "bttsno", "bothteamstoscoreno", "ng"):
             return 1.0 - yes, "Independent-Poisson estimate for both teams to score: no"
         return None, "Unsupported BTTS selection label"
 
@@ -192,11 +205,12 @@ def _selection_probability(market, selection, home_rate, away_rate):
         home_win = sum(prob for h, a, prob in scores if h > a)
         draw = sum(prob for h, a, prob in scores if h == a)
         away_win = sum(prob for h, a, prob in scores if h < a)
-        if selection_text in ("1x", "home/draw", "home draw", "home or draw"):
+        compact_selection = re.sub(r"[^a-z0-9]+", "", selection_text)
+        if compact_selection in ("1x", "homedraw", "homeordraw", "homeordrawwin", "team1ordraw", "1ordraw", "1orx", "homeordrawdoublechance"):
             return home_win + draw, "Independent-Poisson estimate for home-or-draw"
-        if selection_text in ("x2", "draw/away", "draw away", "draw or away"):
+        if compact_selection in ("x2", "drawaway", "draworaway", "draworawaywin", "draworteam2", "drawor2"):
             return draw + away_win, "Independent-Poisson estimate for draw-or-away"
-        if selection_text in ("12", "home or away", "no draw"):
+        if compact_selection in ("12", "homeoraway", "homeorawaywin", "nodraw", "team1orteam2", "1or2"):
             return home_win + away_win, "Independent-Poisson estimate for no draw"
         if selection_text in ("home", "home win", "1"):
             return home_win, "Independent-Poisson estimate for home win"
@@ -2561,7 +2575,7 @@ activatePage();
 # ---------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SolveEase/3.8.5"
+    server_version = "SolveEase/3.8.6"
 
     def log_message(self, fmt, *args):
         # Avoid logging query strings, POST bodies, and booking codes.
@@ -2658,7 +2672,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "status": "online",
                 "service": "SolveEase Booking & Arbitrage Dashboard",
-                "version": "3.8.5",
+                "version": "3.8.6",
                 "configured_feeds": configured,
                 "feed_status": feed_status,
                 "feed_freshness_threshold_seconds": STALE_AFTER_SECONDS,
@@ -2830,7 +2844,7 @@ def main():
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
-    logging.info("SolveEase Booking & Arbitrage Dashboard v3.8.5 listening on port %s", PORT)
+    logging.info("SolveEase Booking & Arbitrage Dashboard v3.8.6 listening on port %s", PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

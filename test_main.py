@@ -258,6 +258,27 @@ class ScannerTests(unittest.TestCase):
         self.assertNotIn('Original ticket selections ·', app.HTML)
         self.assertNotIn('Odds-implied ranking remains available', app.HTML)
 
+    def test_wider_european_league_coverage_is_configured(self):
+        self.assertIn("E2", app.FOOTBALL_DIVISIONS)
+        self.assertIn("E3", app.FOOTBALL_DIVISIONS)
+        self.assertIn("D2", app.FOOTBALL_DIVISIONS)
+        self.assertIn("SP2", app.FOOTBALL_DIVISIONS)
+        self.assertIn("F2", app.FOOTBALL_DIVISIONS)
+
+    def test_common_double_chance_labels_are_recognized(self):
+        p1, _ = app._selection_probability("Double Chance", "1 or X", 1.7, 0.9)
+        p2, _ = app._selection_probability("Double Chance", "Home or Draw", 1.7, 0.9)
+        self.assertIsNotNone(p1)
+        self.assertIsNotNone(p2)
+        self.assertAlmostEqual(p1, p2, places=6)
+
+    def test_common_btts_labels_are_recognized(self):
+        yes, _ = app._selection_probability("Both Teams To Score", "GG", 1.7, 0.9)
+        no, _ = app._selection_probability("BTTS", "NG", 1.7, 0.9)
+        self.assertIsNotNone(yes)
+        self.assertIsNotNone(no)
+        self.assertAlmostEqual(yes + no, 1.0, places=6)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
