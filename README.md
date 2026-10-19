@@ -1,4 +1,4 @@
-# SolveEase Booking & Arbitrage Dashboard — v3.8.2
+# SolveEase Booking & Arbitrage Dashboard — v3.8.4
 
 A single, integrated, standard-library Python application for read-only booking analysis, ticket conversion checklists, odds scanning/arbitrage calculations, daily fixture screening, same-fixture ticket optimization, model diagnostics and optional Telegram alerts. It does **not** place bets or create valid bookmaker booking codes.
 
@@ -93,6 +93,18 @@ A probability value in a payload is not automatically verified simply because it
 - The ZIP cannot verify external feeds, live market availability, bookmaker coverage, or deployment credentials from the build environment. Those require post-deployment checks.
 
 
-## v3.8.2 compact booking and filter workspace
+## v3.8.4 compact booking and filter workspace
 
 The booking code entry and filter review now share one compact workspace. Original ticket details, filtered-out selections, unverified selections, and advanced statistical analysis are collapsed by default. Retained selections are shown as compact rows, with the filtered-ticket transfer action kept visible. The active original booking code is cleared when the filtered set is applied.
+
+
+## v3.8.4 automatic-stats response hardening
+
+- API JSON serialization converts non-finite numeric values (`NaN`, `Infinity`, `-Infinity`) to JSON `null`, instead of aborting response serialization.
+- Browser API errors now report the endpoint, HTTP status, content type and a short response excerpt when the server returns HTML, plain text or an empty body instead of JSON.
+- This improves resilience and diagnostics; it does not by itself guarantee that live Football-Data or Understat sources are reachable or that every fixture can be modeled.
+
+
+## v3.8.4 automatic filtered-only lookup
+
+Booking-code submission now runs lookup and model analysis as one flow. The input code is cleared immediately, the original/unfiltered ticket is never displayed or persisted, and only matched selections with model estimates at or above 70% are rendered and saved for reconstruction. If automatic statistics fail, the UI reports a concise error rather than silently presenting odds-implied ranking as a model forecast.

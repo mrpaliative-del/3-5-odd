@@ -44,15 +44,34 @@ class ScannerTests(unittest.TestCase):
         self.assertIsNone(app.finite_number(float("nan")))
         self.assertIsNone(app.finite_number(float("inf")))
 
-    def test_lookup_ui_auto_ranks_and_filters_ticket_legs(self):
-        self.assertIn("renderTicketMathReview(data, box)", app.HTML)
-        self.assertIn("raw odds-implied probability", app.HTML)
-        self.assertIn("Minimum individual implied probability", app.HTML)
+    def test_json_response_sanitizes_non_finite_numbers(self):
+        handler = app.Handler.__new__(app.Handler)
+        captured = {}
+        handler.send_bytes = lambda status, body, content_type: captured.update(status=status, body=body, content_type=content_type)
+        handler.send_json(200, {"ok": True, "probability": float("nan"), "nested": [float("inf"), 0.7]})
+        payload = json.loads(captured["body"].decode("utf-8"))
+        self.assertEqual(captured["status"], 200)
+        self.assertEqual(captured["content_type"], "application/json; charset=utf-8")
+        self.assertIsNone(payload["probability"])
+        self.assertIsNone(payload["nested"][0])
+        self.assertEqual(payload["nested"][1], 0.7)
+
+    def test_api_helper_reports_http_and_content_type_for_non_json(self):
+        self.assertIn('returned HTTP ', app.HTML)
+        self.assertIn('not JSON', app.HTML)
+        self.assertIn('response.headers.get("content-type")', app.HTML)
+
+    def test_lookup_automatically_filters_and_only_shows_retained_output(self):
+        self.assertIn('api("/api/lookup", "POST"', app.HTML)
+        self.assertIn('api("/api/analyze-ticket", "POST"', app.HTML)
+        self.assertIn('const threshold = 0.70;', app.HTML)
+        self.assertIn('$("code").value = "";', app.HTML)
+        self.assertIn('Persist only the filtered output', app.HTML)
         self.assertIn("lookup-entry", app.HTML)
-        self.assertIn("Original ticket selections", app.HTML)
-        self.assertIn("lookup-advanced", app.HTML)
-        self.assertIn("Filtered out", app.HTML)
-        self.assertIn("No probability is fabricated", app.HTML)
+        self.assertNotIn("renderTicketMathReview(data, box)", app.HTML)
+        self.assertNotIn("Original ticket selections ·", app.HTML)
+        self.assertNotIn("Filtered out ·", app.HTML)
+        self.assertNotIn("Minimum individual implied probability", app.HTML)
 
     def test_all_dashboard_pages_exist_and_betslip_ui_is_present(self):
         for page_id in ("homePage", "lookupPanel", "converterPanel", "scannerPanel", "statusPanel"):
@@ -229,10 +248,13 @@ class ScannerTests(unittest.TestCase):
         self.assertIsNotNone(probability)
         self.assertIn("over 2.5", method)
 
-    def test_auto_stats_ui_is_triggered_after_ticket_lookup(self):
+    def test_auto_stats_runs_and_only_filtered_output_is_rendered(self):
         self.assertIn('api("/api/analyze-ticket", "POST"', app.HTML)
-        self.assertIn("Automatic statistical analysis", app.HTML)
-        self.assertIn("Fetching recent results and home/away performance", app.HTML)
+        self.assertIn('const threshold = 0.70;', app.HTML)
+        self.assertIn('sessionStorage.removeItem("solveease:lastLookup")', app.HTML)
+        self.assertIn('Persist only the filtered output', app.HTML)
+        self.assertNotIn('Original ticket selections ·', app.HTML)
+        self.assertNotIn('Odds-implied ranking remains available', app.HTML)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

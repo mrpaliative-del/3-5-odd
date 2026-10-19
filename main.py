@@ -2,7 +2,7 @@
 """
 SolveEase Booking & Arbitrage Dashboard
 Python standard library only.
-Version: 3.8.1
+Version: 3.8.4
 
 Render start command:
     python main.py
@@ -2019,13 +2019,14 @@ function activatePage() {
 function restoreLookup() {
   try { lastLookupData = JSON.parse(sessionStorage.getItem("solveease:lastLookup") || "null"); }
   catch (_) { lastLookupData = null; }
-  if (lastLookupData && lastLookupData.ok === true) {
-    if (lastLookupData.filtered_ticket) {
-      $("converterMessage").textContent = "Filtered selection set restored. Only retained selections are available; the original booking code was discarded.";
-    } else {
-      $("converterMessage").textContent = "Previous successful lookup restored for this browser tab.";
-    }
-    $("converterMessage").className = "success";
+  // Only restore filtered output. Remove legacy session data that may contain an unfiltered ticket.
+  if (lastLookupData && (lastLookupData.ok !== true || lastLookupData.filtered_ticket !== true || !Array.isArray(lastLookupData.legs))) {
+    lastLookupData = null;
+    try { sessionStorage.removeItem("solveease:lastLookup"); } catch (_) {}
+  }
+  if (lastLookupData && lastLookupData.ok === true && lastLookupData.filtered_ticket === true) {
+    $("converterMessage").textContent = "";
+    $("converterMessage").className = "";
   }
 }
 
@@ -2105,16 +2106,22 @@ function money(value, digits=2) {
   return Number(value).toLocaleString("en-US", {minimumFractionDigits:digits,maximumFractionDigits:digits});
 }
 async function api(path, method="GET", body=null) {
-  const options = {method, headers:{}};
+  const options = {method, headers:{"Accept":"application/json"}};
   if (body !== null) {
     options.headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(body);
   }
   const response = await fetch(path, options);
+  const contentType = (response.headers.get("content-type") || "").toLowerCase();
+  const raw = await response.text();
   let data;
-  try { data = await response.json(); }
-  catch (_) { throw new Error("Server returned an unreadable response."); }
-  if (!response.ok || data.ok === false) throw new Error(data.error || "Request failed.");
+  try { data = JSON.parse(raw); }
+  catch (_) {
+    const excerpt = raw.replace(/\s+/g, " ").trim().slice(0, 140);
+    const type = contentType || "unknown content type";
+    throw new Error("API " + path + " returned HTTP " + response.status + " with " + type + ", not JSON" + (excerpt ? ": " + excerpt : " (empty response)"));
+  }
+  if (!response.ok || data.ok === false) throw new Error(data.error || ("Request failed (HTTP " + response.status + ")."));
   return data;
 }
 
@@ -2134,240 +2141,89 @@ function clearLookup() {
 
 async function lookup() {
   const code = $("code").value.trim();
-  if (!code) {
-    $("lookupMessage").textContent = "Enter a booking code.";
-    $("lookupMessage").className = "warning";
-    return;
-  }
+  if (!code) return;
+  // The booking code is a one-time input: clear it immediately and never persist it.
+  $("code").value = "";
   lastLookupData = null;
   preparedTicketText = "";
+  try { sessionStorage.removeItem("solveease:lastLookup"); } catch (_) {}
   clear("ticketResult");
   clear("converterSummary");
-  $("convertedTicket").textContent = "Look up a supported booking code first.";
-  $("converterMessage").textContent = "";
+  if ($("convertedTicket")) $("convertedTicket").textContent = "No filtered selections yet.";
+  if ($("converterMessage")) { $("converterMessage").textContent = ""; $("converterMessage").className = ""; }
   $("lookupBtn").disabled = true;
-  $("lookupMessage").textContent = "Checking supported lookup sources…";
+  $("lookupMessage").textContent = "Filtering selections…";
   $("lookupMessage").className = "";
-
   try {
-    const data = await api("/api/lookup", "POST", {code, bookmaker:"auto"});
-    lastLookupData = data;
-    try { sessionStorage.setItem("solveease:lastLookup", JSON.stringify(data)); } catch (_) {}
-    $("lookupMessage").textContent = "Lookup completed and source confirmed.";
-    $("lookupMessage").className = "success";
-    const box = $("ticketResult");
-    const title = el("div", "", box, "item");
-    el("h3", "Verified source: " + data.bookmaker, title);
-    el("p", data.bookmaker_identification || "Confirmed by successful lookup.", title, "small");
-
-    const stats = el("div", "", box, "grid");
-    [
-      ["Selections displayed", data.displayed_selections_count],
-      ["Source selection count", data.source_selection_count],
-      ["Source combined odds", money(data.source_combined_odds)],
-      ["Calculated odds", money(data.calculated_combined_odds)],
-      ["Odds agree", data.odds_agree === null ? "Cannot verify" : (data.odds_agree ? "Yes" : "No")],
-      ["Ticket status", data.status],
-      ["Stake", data.stake == null ? "Not provided" : String(data.stake) + " (units unverified)"],
-      ["Potential return", data.potential_return == null ? "Not provided" : String(data.potential_return) + " (units unverified)"]
-    ].forEach(([label,value]) => {
-      const stat = el("div", "", stats, "stat");
-      el("span", label, stat);
-      el("strong", value ?? "Not provided", stat);
+    const source = await api("/api/lookup", "POST", {code, bookmaker:"auto"});
+    if (!Array.isArray(source.legs) || !source.legs.length) throw new Error("No ticket selections were returned.");
+    // Automatically run the model before showing anything. The source ticket is kept only in memory
+    // during this request and is never stored in sessionStorage or displayed.
+    const report = await api("/api/analyze-ticket", "POST", {
+      legs: source.legs.map(leg => ({event:leg.event, market:leg.market, selection:leg.selection, odds:leg.odds_verified ? leg.odds : null}))
     });
-
-    if (data.odds_agree === false) {
-      el("p", "Warning: source odds and calculated odds differ. At least one selection or odds value may be missing or interpreted differently. Review every leg.", box, "warning");
-    }
-    if (data.source_selection_count !== data.displayed_selections_count) {
-      el("p", "Warning: source selection count differs from the displayed outcome count.", box, "warning");
-    }
-
-    const sourceDetails = document.createElement("details");
-    sourceDetails.className = "lookup-details";
-    const sourceSummary = document.createElement("summary");
-    sourceSummary.textContent = "Original ticket selections · " + (data.legs || []).length + " legs (expand for full source details)";
-    sourceDetails.appendChild(sourceSummary);
-    const sourceBody = document.createElement("div"); sourceBody.className = "lookup-details-body"; sourceDetails.appendChild(sourceBody);
-    (data.legs || []).forEach(leg => {
-      const card = el("div", "", sourceBody, "filtered-leg");
-      const info = el("div", "", card);
-      el("strong", String(leg.number) + ". " + (leg.event || "Event unavailable"), info);
-      el("p", (leg.market || "Market needs verification") + " · " + (leg.selection || "Selection needs verification"), info);
-      if (leg.kickoff) el("p", "Kickoff/source time: " + leg.kickoff, info, "small");
-      el("span", leg.odds_verified ? money(leg.odds, 3) : "Unverified odds", card, "leg-metric");
+    const all = Array.isArray(report.ranked_legs) ? report.ranked_legs : [];
+    const threshold = 0.70;
+    const estimated = all.filter(leg => leg.status === "estimated" && Number.isFinite(Number(leg.estimated_probability)));
+    const kept = estimated.filter(leg => Number(leg.estimated_probability) >= threshold);
+    const norm = value => String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
+    const remaining = source.legs.slice();
+    const retainedSourceLegs = [];
+    const retainedAnalysis = [];
+    kept.forEach(leg => {
+      const index = remaining.findIndex(sourceLeg => norm(sourceLeg.event) === norm(leg.event) && norm(sourceLeg.market) === norm(leg.market) && norm(sourceLeg.selection) === norm(leg.selection));
+      if (index >= 0) {
+        retainedSourceLegs.push({...remaining.splice(index, 1)[0], estimated_probability:Number(leg.estimated_probability), model_fair_odds:leg.model_fair_odds, estimated_edge_percent:leg.estimated_edge_percent, stats:leg.stats || {}});
+        retainedAnalysis.push(leg);
+      }
     });
-    box.appendChild(sourceDetails);
-    el("p", data.note || "Verify details at the source bookmaker.", box, "small");
-    renderTicketMathReview(data, box);
+    // Persist only the filtered output; never persist the submitted code or unfiltered source legs.
+    lastLookupData = {
+      ok:true, filtered_ticket:true, original_booking_code_discarded:true,
+      bookmaker:source.bookmaker, bookmaker_key:source.bookmaker_key,
+      retrieved_at:source.retrieved_at, legs:retainedSourceLegs,
+      displayed_selections_count:retainedSourceLegs.length,
+      source_selection_count:retainedSourceLegs.length,
+      original_selection_count:source.legs.length,
+      note:"Automatically filtered to model-estimated selections at or above 70%. This is a reconstruction set, not a newly issued bookmaker code."
+    };
+    try {
+      if (retainedSourceLegs.length) sessionStorage.setItem("solveease:lastLookup", JSON.stringify(lastLookupData));
+      else sessionStorage.removeItem("solveease:lastLookup");
+    } catch (_) {}
+    const output = $("ticketResult");
+    if (!retainedSourceLegs.length) {
+      $("lookupMessage").textContent = "No selections met the 70% model threshold.";
+      $("lookupMessage").className = "warning";
+      lastLookupData = null;
+      return;
+    }
+    $("lookupMessage").textContent = "";
+    $("lookupMessage").className = "";
+    const list = el("div", "", output, "filtered-output");
+    retainedSourceLegs.forEach((leg, index) => {
+      const row = el("article", "", list, "filtered-leg");
+      const info = el("div", "", row);
+      el("strong", (index + 1) + ". " + (leg.event || "Event unavailable"), info);
+      el("p", (leg.market || "Market unavailable") + " · " + (leg.selection || "Selection unavailable"), info);
+      el("span", (Number(leg.estimated_probability) * 100).toFixed(1) + "%", row, "leg-metric");
+    });
+    // The converter is primed silently with retained legs only. No source code is carried forward.
+    if ($("converterMessage")) {
+      $("converterMessage").textContent = "";
+      $("converterMessage").className = "";
+    }
+    if ($("convertedTicket")) $("convertedTicket").textContent = "Filtered selections are ready. Open the converter to prepare a reconstruction checklist.";
   } catch (err) {
-    $("lookupMessage").textContent = err.message;
+    lastLookupData = null;
+    try { sessionStorage.removeItem("solveease:lastLookup"); } catch (_) {}
+    $("lookupMessage").textContent = "Filtering unavailable: " + err.message;
     $("lookupMessage").className = "error";
   } finally {
     $("lookupBtn").disabled = false;
   }
 }
 
-
-function renderTicketMathReview(data, parent) {
-  const panel = el("section", "", parent, "panel lookup-filter-panel");
-  el("h3", "Filter selections", panel);
-  el("p", "Ranked by raw odds-implied probability (1 ÷ decimal odds). This is an odds-based screening rule, not an independently verified forecast.", panel, "small");
-  const verified = (data.legs || []).filter(leg => leg.odds_verified === true && Number.isFinite(Number(leg.odds)) && Number(leg.odds) > 1);
-  const unknown = (data.legs || []).filter(leg => !leg.odds_verified || !Number.isFinite(Number(leg.odds)) || Number(leg.odds) <= 1);
-  const combined = verified.length === (data.legs || []).length && verified.length
-    ? verified.reduce((value, leg) => value * (1 / Number(leg.odds)), 1) : null;
-  const stats = el("div", "", panel, "lookup-summary");
-  [["Usable odds", verified.length], ["Unverified", unknown.length], ["Naive combined chance", combined === null ? "N/A" : (combined * 100).toFixed(3) + "%"]].forEach(([label, value]) => {
-    const card = el("div", "", stats, "stat"); el("span", label, card); el("strong", String(value), card);
-  });
-  if (combined !== null) {
-    const caveat = document.createElement("details"); caveat.className = "lookup-details";
-    const caveatSummary = document.createElement("summary"); caveatSummary.textContent = "About combined implied probability"; caveat.appendChild(caveatSummary);
-    el("p", "This figure multiplies individual implied probabilities under an independence assumption. It is not a calibrated accumulator forecast; correlated legs and bookmaker margin can make it misleading.", caveat, "small notice"); panel.appendChild(caveat);
-  }
-  const toolbar = el("div", "", panel, "filter-toolbar");
-  const label = el("label", "Minimum individual implied probability", toolbar);
-  const select = document.createElement("select");
-  [10, 20, 30, 40, 50, 60, 70].forEach(value => {
-    const option = document.createElement("option"); option.value = String(value); option.textContent = value + "% or higher"; if (value === 70) option.selected = true; select.appendChild(option);
-  });
-  label.appendChild(select);
-  const summary = el("div", "", toolbar, "filter-summary");
-  const list = el("div", "", panel);
-  function redraw() {
-    clearChildren(list);
-    const threshold = Number(select.value) / 100;
-    const ranked = verified.map(leg => ({...leg, implied: 1 / Number(leg.odds)})).sort((a,b) => b.implied - a.implied);
-    const kept = ranked.filter(leg => leg.implied >= threshold);
-    const filtered = ranked.filter(leg => leg.implied < threshold);
-    summary.textContent = "Kept " + kept.length + " · filtered below threshold " + filtered.length + " · unverified odds " + unknown.length + ". Filter is a screening rule, not proof a selection is good.";
-    if (!ranked.length) el("p", "No selections have verifiable decimal odds, so probability ranking is unavailable.", list, "warning");
-    kept.forEach((leg, index) => {
-      const card = el("article", "", list, "filtered-leg");
-      const info = el("div", "", card);
-      el("strong", (index + 1) + ". " + (leg.event || "Event unavailable"), info);
-      el("p", (leg.market || "Market unknown") + " · " + (leg.selection || "Selection unknown"), info);
-      el("p", "Retained at selected threshold", info);
-      el("span", Number(leg.odds).toFixed(3) + " · " + (leg.implied * 100).toFixed(2) + "%", card, "leg-metric");
-    });
-    if (filtered.length) {
-      const removedDetails = document.createElement("details"); removedDetails.className = "lookup-details";
-      const removedSummary = document.createElement("summary"); removedSummary.textContent = "Filtered out · " + filtered.length + " selections (not included in output)"; removedDetails.appendChild(removedSummary);
-      filtered.forEach(leg => {
-        const card = el("article", "", removedDetails, "filtered-leg"); const info = el("div", "", card);
-        el("strong", leg.event || "Event unavailable", info);
-        el("p", (leg.market || "Market unknown") + " · " + (leg.selection || "Selection unknown"), info);
-        el("span", (leg.implied * 100).toFixed(2) + "%", card, "leg-metric");
-      }); list.appendChild(removedDetails);
-    }
-    if (unknown.length) {
-      const unknownDetails = document.createElement("details"); unknownDetails.className = "lookup-details";
-      const unknownSummary = document.createElement("summary"); unknownSummary.textContent = "Unverified odds · " + unknown.length + " selections (not ranked)"; unknownDetails.appendChild(unknownSummary);
-      unknown.forEach(leg => { const row = el("article", "", unknownDetails, "filtered-leg"); el("strong", (leg.event || "Event unavailable") + " — not ranked", row); el("p", "Odds or selected outcome could not be verified. No probability is fabricated.", row, "small warning"); });
-      list.appendChild(unknownDetails);
-    }
-  }
-  select.addEventListener("change", redraw);
-  redraw();
-  // Automatically run the historical team-stat analysis after a successful ticket lookup.
-  if (Array.isArray(data.legs) && data.legs.length) {
-    const autoPanel = document.createElement("details"); autoPanel.className = "lookup-advanced";
-    const autoSummary = document.createElement("summary"); autoSummary.textContent = "Advanced statistical analysis · model estimates and transfer controls"; autoPanel.appendChild(autoSummary);
-    parent.appendChild(autoPanel);
-    el("h3", "Automatic statistical analysis", autoPanel);
-    const status = el("p", "Fetching recent results and home/away performance…", autoPanel, "small");
-    const results = el("div", "", autoPanel);
-    api("/api/analyze-ticket", "POST", {legs: data.legs.map(leg => ({event: leg.event, market: leg.market, selection: leg.selection, odds: leg.odds_verified ? leg.odds : null}))})
-      .then(report => {
-        clearChildren(results);
-        status.textContent = "Automatic analysis finished: " + report.estimated_legs + " estimated, " + report.unavailable_legs + " unavailable.";
-        const thresholdLabel = el("label", "Minimum model probability to retain", autoPanel);
-        const thresholdSelect = document.createElement("select");
-        [10,20,30,40,50,60,70].forEach(value => {
-          const option = document.createElement("option"); option.value = String(value); option.textContent = value + "% or higher";
-          if (value === 70) option.selected = true; thresholdSelect.appendChild(option);
-        });
-        thresholdLabel.appendChild(thresholdSelect);
-        const summary = el("p", "", autoPanel, "small");
-        let currentKept = [];
-        const actionBar = el("div", "", panel, "lookup-action");
-        const applyFilteredButton = el("button", "Use retained selections in converter", actionBar);
-        applyFilteredButton.type = "button";
-        applyFilteredButton.disabled = true;
-        const applyFilteredNote = el("p", "Only retained, estimated selections will be carried forward. The original booking code is discarded when you apply the filtered set.", actionBar, "small notice");
-        applyFilteredButton.addEventListener("click", () => {
-          if (!currentKept.length || !lastLookupData || !Array.isArray(lastLookupData.legs)) return;
-          const norm = value => String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
-          const remaining = lastLookupData.legs.slice();
-          const selectedSourceLegs = [];
-          currentKept.forEach(leg => {
-            const index = remaining.findIndex(source => norm(source.event) === norm(leg.event) && norm(source.market) === norm(leg.market) && norm(source.selection) === norm(leg.selection));
-            if (index >= 0) selectedSourceLegs.push(remaining.splice(index, 1)[0]);
-          });
-          if (!selectedSourceLegs.length) {
-            applyFilteredNote.textContent = "Could not safely match the retained analysis results back to the original ticket. Nothing was changed.";
-            applyFilteredNote.className = "small warning";
-            return;
-          }
-          lastLookupData = {...lastLookupData, legs:selectedSourceLegs, displayed_selections_count:selectedSourceLegs.length, source_selection_count:selectedSourceLegs.length, filtered_ticket:true, original_selection_count:(lastLookupData.original_selection_count || data.source_selection_count || data.legs.length), original_booking_code_discarded:true, note:"Filtered ticket derived from retained model-estimated selections only. This is not a new bookmaker booking code."};
-          try { sessionStorage.setItem("solveease:lastLookup", JSON.stringify(lastLookupData)); } catch (_) {}
-          if ($("code")) $("code").value = "";
-          if ($("manualTicketJson")) $("manualTicketJson").value = "";
-          preparedTicketText = "";
-          if ($("convertedTicket")) $("convertedTicket").textContent = "Filtered selection set ready. Prepare the reconstruction checklist to view only retained selections.";
-          if ($("converterMessage")) { $("converterMessage").textContent = "Filtered selection set applied: " + selectedSourceLegs.length + " retained. The original booking code has been discarded from the active ticket state."; $("converterMessage").className = "success"; }
-          applyFilteredNote.textContent = "Applied " + selectedSourceLegs.length + " retained selections to the converter. The original booking code is not carried forward; this is a reconstruction checklist, not a newly issued code.";
-          applyFilteredNote.className = "small success";
-          applyFilteredButton.textContent = "Filtered selections applied";
-          applyFilteredButton.disabled = true;
-        });
-        function redrawAutomatic() {
-          clearChildren(results);
-          const all = report.ranked_legs || [];
-          const estimated = all.filter(leg => leg.status === "estimated");
-          const threshold = Number(thresholdSelect.value) / 100;
-          const kept = estimated.filter(leg => leg.estimated_probability >= threshold);
-          currentKept = kept;
-          applyFilteredButton.disabled = kept.length === 0;
-          applyFilteredButton.textContent = kept.length ? "Use " + kept.length + " retained selections in converter" : "No qualifying selections to transfer";
-          applyFilteredNote.textContent = "Only retained, estimated selections will be carried forward. Filtered-out and unavailable selections will not be included. The original booking code will not be retained as if it represented this changed ticket.";
-          applyFilteredNote.className = "small notice";
-          const filtered = estimated.filter(leg => leg.estimated_probability < threshold);
-          const unavailable = all.filter(leg => leg.status !== "estimated");
-          summary.textContent = "Retained " + kept.length + " · filtered below probability threshold " + filtered.length + " · unavailable " + unavailable.length + ". Threshold is a screening rule, not a guarantee.";
-          function renderLeg(leg, rank, target, isFiltered) {
-            const card = el("article", "", target, "item");
-            el("h4", (rank ? rank + ". " : "") + (leg.event || "Event unavailable"), card);
-            el("p", (leg.market || "Market unavailable") + " — " + (leg.selection || "Selection unavailable"), card);
-            if (leg.status === "estimated") {
-              el("p", "Estimated probability " + money(leg.estimated_probability * 100) + "% · fair odds " + money(leg.model_fair_odds, 3), card, isFiltered ? "warning" : "success");
-              if (leg.odds != null && leg.odds_implied_probability != null) el("p", "Odds-implied " + money(leg.odds_implied_probability * 100) + "% · model edge " + money(leg.estimated_edge_percent) + "%", card, "small");
-              el("p", (leg.stats.league || "League not specified") + " · latest result " + (leg.stats.latest_match_date || "unknown") + " · source " + (leg.stats.source || "unknown"), card, "small");
-              const hs = leg.stats.home_stats || {}, as = leg.stats.away_stats || {};
-              el("p", "Home team recent form: " + (hs.recent_matches_used ?? 0) + " matches · GF " + (hs.recent_goals_for_avg ?? "n/a") + " / GA " + (hs.recent_goals_against_avg ?? "n/a") + " per match · home venue sample " + (hs.home_matches ?? 0) + " · home GF/GA " + (hs.home_goals_for_avg ?? "n/a") + "/" + (hs.home_goals_against_avg ?? "n/a"), card, "small");
-              el("p", "Away team recent form: " + (as.recent_matches_used ?? 0) + " matches · GF " + (as.recent_goals_for_avg ?? "n/a") + " / GA " + (as.recent_goals_against_avg ?? "n/a") + " per match · away venue sample " + (as.away_matches ?? 0) + " · away GF/GA " + (as.away_goals_for_avg ?? "n/a") + "/" + (as.away_goals_against_avg ?? "n/a"), card, "small");
-              el("p", "Estimated home/away goal rates " + leg.home_goal_rate + " / " + leg.away_goal_rate + ". " + (leg.stats.xg_note || ""), card, "small notice");
-            } else el("p", leg.reason || (leg.stats && leg.stats.reason) || "Not enough reliable data to estimate this selection.", card, "warning");
-          }
-          kept.forEach((leg, idx) => renderLeg(leg, idx + 1, results, false));
-          if (filtered.length) {
-            el("h4", "Filtered below threshold", results);
-            filtered.forEach(leg => renderLeg(leg, null, results, true));
-          }
-          if (unavailable.length) {
-            el("h4", "Not estimated — insufficient evidence", results);
-            unavailable.forEach(leg => renderLeg(leg, null, results, true));
-          }
-          if (!all.length) el("p", "No ticket legs were available to analyze.", results, "warning");
-        }
-        thresholdSelect.addEventListener("change", redrawAutomatic);
-        redrawAutomatic();
-        (report.warnings || []).forEach(w => el("p", w, autoPanel, "small notice"));
-      })
-      .catch(err => { status.textContent = "Automatic stats unavailable: " + err.message + ". Odds-implied ranking remains available."; status.className = "warning"; });
-  }
-}
 function clearChildren(node) { node.replaceChildren(); }
 
 function prepareConversion() {
@@ -2690,7 +2546,7 @@ activatePage();
 # ---------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SolveEase/3.7.1"
+    server_version = "SolveEase/3.8.4"
 
     def log_message(self, fmt, *args):
         # Avoid logging query strings, POST bodies, and booking codes.
@@ -2715,7 +2571,25 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def send_json(self, status, data):
-        body = json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        # Never let NaN/Infinity or an unexpected value abort serialization and
+        # leave the browser with an empty/truncated response. Non-finite numbers
+        # are represented as JSON null and remain visibly unavailable to clients.
+        def clean(value):
+            if isinstance(value, float) and not math.isfinite(value):
+                return None
+            if isinstance(value, dict):
+                return {str(key): clean(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [clean(item) for item in value]
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            return str(value)
+        try:
+            body = json.dumps(clean(data), ensure_ascii=False, allow_nan=False).encode("utf-8")
+        except Exception:
+            logging.exception("JSON response serialization failed")
+            status = 500
+            body = json.dumps({"ok": False, "error": "Response serialization failed safely. Please retry; no selections were changed."}).encode("utf-8")
         self.send_bytes(status, body, "application/json; charset=utf-8")
 
     def read_body(self):
@@ -2769,7 +2643,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "status": "online",
                 "service": "SolveEase Booking & Arbitrage Dashboard",
-                "version": "3.8.1",
+                "version": "3.8.4",
                 "configured_feeds": configured,
                 "feed_status": feed_status,
                 "feed_freshness_threshold_seconds": STALE_AFTER_SECONDS,
@@ -2941,7 +2815,7 @@ def main():
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
-    logging.info("SolveEase Booking & Arbitrage Dashboard v3.8.2 listening on port %s", PORT)
+    logging.info("SolveEase Booking & Arbitrage Dashboard v3.8.4 listening on port %s", PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
