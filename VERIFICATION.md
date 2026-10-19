@@ -1,4 +1,4 @@
-# v3.8.1 verification record
+# v3.8.2 verification record
 
 Verified locally in the build environment on 2026-10-19:
 

@@ -47,7 +47,10 @@ class ScannerTests(unittest.TestCase):
     def test_lookup_ui_auto_ranks_and_filters_ticket_legs(self):
         self.assertIn("renderTicketMathReview(data, box)", app.HTML)
         self.assertIn("raw odds-implied probability", app.HTML)
-        self.assertIn("Minimum individual implied probability to keep", app.HTML)
+        self.assertIn("Minimum individual implied probability", app.HTML)
+        self.assertIn("lookup-entry", app.HTML)
+        self.assertIn("Original ticket selections", app.HTML)
+        self.assertIn("lookup-advanced", app.HTML)
         self.assertIn("Filtered out", app.HTML)
         self.assertIn("No probability is fabricated", app.HTML)
 

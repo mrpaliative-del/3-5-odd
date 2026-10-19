@@ -1785,6 +1785,42 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
 @media(max-width:720px){.dashboard-tools{grid-template-columns:1fr}.dashboard-button{min-height:200px}.dashboard-hero h1{font-size:30px}}
 .page-section{display:none}.page-section:not(.page-hidden){display:block;animation:pageIn .18s ease-out}.page-hidden{display:none!important}.eyebrow{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);font-weight:800}.page-title{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}.page-title p{max-width:760px;margin-top:6px}.compact-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.summary-card{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:14px}.summary-card strong{display:block;font-size:18px}.summary-card span{color:var(--muted);font-size:12px}.subnav{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}.subnav a{color:var(--blue);font-size:13px;text-decoration:none;font-weight:750}.report-details{margin-top:12px;border:1px solid var(--line);border-radius:10px;padding:11px 13px;background:rgba(9,16,29,.45)}.report-details summary{cursor:pointer;font-weight:750;color:var(--blue)}@keyframes pageIn{from{opacity:.7;transform:translateY(3px)}to{opacity:1;transform:translateY(0)}}
 @media(min-width:760px){.two-col{display:grid;grid-template-columns:1fr 1fr;gap:14px}.two-col .panel{margin:0}}
+
+/* v3.8.2 compact booking + filtering workspace */
+.lookup-workspace{padding:clamp(14px,2.4vw,24px)}
+.lookup-entry{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:end}
+.lookup-entry label{margin:0 0 6px;display:block}
+.lookup-entry input{width:100%;min-width:0}
+.lookup-entry .actions{margin:0;display:flex;gap:8px;flex-wrap:wrap}
+.lookup-entry .actions button{white-space:nowrap}
+.lookup-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:8px;margin:12px 0}
+.lookup-summary .stat{padding:10px 12px;min-width:0}
+.lookup-summary .stat strong{font-size:16px;overflow-wrap:anywhere}
+.lookup-details{margin:10px 0;border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:var(--panel2)}
+.lookup-details>summary{cursor:pointer;font-weight:750;display:flex;align-items:center;justify-content:space-between;gap:10px;list-style:none}
+.lookup-details>summary::-webkit-details-marker{display:none}
+.lookup-details>summary:after{content:'+';font-size:18px;color:var(--blue)}
+.lookup-details[open]>summary:after{content:'−'}
+.lookup-details-body{padding-top:10px}
+.filter-toolbar{display:grid;grid-template-columns:minmax(160px,240px) minmax(0,1fr);gap:12px;align-items:end;margin:12px 0}
+.filter-toolbar label{margin:0}
+.filter-toolbar select{width:100%}
+.filter-summary{font-weight:750;padding:9px 11px;border-radius:9px;background:var(--panel2);margin:8px 0}
+.filtered-leg{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;padding:10px 12px;margin:7px 0;border:1px solid var(--line);border-radius:9px;background:var(--panel2)}
+.filtered-leg strong{display:block;overflow-wrap:anywhere}
+.filtered-leg p{margin:3px 0 0;font-size:13px;color:var(--muted)}
+.filtered-leg .leg-metric{font-weight:800;white-space:nowrap;font-variant-numeric:tabular-nums}
+.lookup-filter-panel{margin-top:12px}
+.lookup-filter-panel>h3{margin-bottom:5px}
+.lookup-filter-panel>.small{max-width:850px}
+.lookup-action{position:sticky;bottom:8px;z-index:3;display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px;margin:10px 0;border:1px solid var(--line);border-radius:12px;background:var(--panel);box-shadow:0 5px 22px rgba(0,0,0,.18)}
+.lookup-action p{margin:0;flex:1;min-width:160px}
+.lookup-action button{min-height:44px}
+.lookup-advanced{margin-top:10px}
+.lookup-advanced>summary{cursor:pointer;font-weight:750;padding:10px;border:1px solid var(--line);border-radius:9px;background:var(--panel2)}
+.lookup-advanced[open]>summary{margin-bottom:10px}
+@media(max-width:600px){.lookup-entry{grid-template-columns:1fr}.lookup-entry .actions button{flex:1}.filter-toolbar{grid-template-columns:1fr}.filtered-leg{grid-template-columns:minmax(0,1fr) auto}.lookup-action{position:static}.lookup-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
 </style>
 </head>
 <body>
@@ -1814,15 +1850,10 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
   <section class="panel dashboard-status"><h2>Service status</h2><div id="homeHealth">Checking service…</div><p class="small">Online status does not guarantee that odds feeds are available, fresh or accurate.</p></section>
 </section>
 
-<section class="panel page-section" id="lookupPanel">
-  <h2>1. Booking-code lookup</h2>
-  <p>Enter a code and the dashboard will verify it using the lookup adapters currently available.</p>
-  <label for="code">Booking code</label>
-  <input id="code" maxlength="120" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Enter booking code">
-  <div class="actions">
-    <button id="lookupBtn" onclick="lookup()">Identify & look up</button>
-    <button class="secondary" onclick="clearLookup()">Clear ticket</button>
-  </div>
+<section class="panel page-section lookup-workspace" id="lookupPanel">
+  <div class="page-title"><div><div class="eyebrow">Tool 01 · Ticket intelligence</div><h2>Booking code & filter</h2><p>Look up once, review the compact summary, then retain only the selections that pass your chosen screen.</p></div></div>
+  <div class="lookup-entry"><div><label for="code">Booking code</label><input id="code" maxlength="120" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Enter booking code"></div>
+  <div class="actions"><button id="lookupBtn" onclick="lookup()">Look up & filter</button><button class="secondary" onclick="clearLookup()">Clear</button></div></div>
   <p class="small">Currently supported: SportyBet read-only lookup. Bet9ja and BetKing are not confirmed from code format alone and do not yet have lookup adapters.</p>
   <div id="lookupMessage" role="status" aria-live="polite"></div>
   <div id="ticketResult"></div>
@@ -2152,15 +2183,21 @@ async function lookup() {
       el("p", "Warning: source selection count differs from the displayed outcome count.", box, "warning");
     }
 
-    el("h3", "Ticket selections", box);
+    const sourceDetails = document.createElement("details");
+    sourceDetails.className = "lookup-details";
+    const sourceSummary = document.createElement("summary");
+    sourceSummary.textContent = "Original ticket selections · " + (data.legs || []).length + " legs (expand for full source details)";
+    sourceDetails.appendChild(sourceSummary);
+    const sourceBody = document.createElement("div"); sourceBody.className = "lookup-details-body"; sourceDetails.appendChild(sourceBody);
     (data.legs || []).forEach(leg => {
-      const card = el("div", "", box, "item");
-      el("strong", String(leg.number) + ". " + (leg.event || "Event unavailable"), card);
-      el("p", "Market: " + (leg.market || "Needs verification"), card);
-      el("p", "Selection: " + (leg.selection || "Needs verification"), card);
-      el("p", "Source odds: " + (leg.odds_verified ? money(leg.odds, 3) : "Unverified"), card);
-      if (leg.kickoff) el("p", "Kickoff/source time: " + leg.kickoff, card, "small");
+      const card = el("div", "", sourceBody, "filtered-leg");
+      const info = el("div", "", card);
+      el("strong", String(leg.number) + ". " + (leg.event || "Event unavailable"), info);
+      el("p", (leg.market || "Market needs verification") + " · " + (leg.selection || "Selection needs verification"), info);
+      if (leg.kickoff) el("p", "Kickoff/source time: " + leg.kickoff, info, "small");
+      el("span", leg.odds_verified ? money(leg.odds, 3) : "Unverified odds", card, "leg-metric");
     });
+    box.appendChild(sourceDetails);
     el("p", data.note || "Verify details at the source bookmaker.", box, "small");
     renderTicketMathReview(data, box);
   } catch (err) {
@@ -2173,25 +2210,30 @@ async function lookup() {
 
 
 function renderTicketMathReview(data, parent) {
-  const panel = el("section", "", parent, "panel");
-  el("h3", "Independent ticket review — ranked and filtered", panel);
-  el("p", "This review does not preserve the booking order. It ranks identifiable legs by raw odds-implied probability (1 ÷ decimal odds), highest first, and filters by your chosen minimum. This is bookmaker-odds arithmetic, not an independently verified forecast.", panel, "small");
+  const panel = el("section", "", parent, "panel lookup-filter-panel");
+  el("h3", "Filter selections", panel);
+  el("p", "Ranked by raw odds-implied probability (1 ÷ decimal odds). This is an odds-based screening rule, not an independently verified forecast.", panel, "small");
   const verified = (data.legs || []).filter(leg => leg.odds_verified === true && Number.isFinite(Number(leg.odds)) && Number(leg.odds) > 1);
   const unknown = (data.legs || []).filter(leg => !leg.odds_verified || !Number.isFinite(Number(leg.odds)) || Number(leg.odds) <= 1);
   const combined = verified.length === (data.legs || []).length && verified.length
     ? verified.reduce((value, leg) => value * (1 / Number(leg.odds)), 1) : null;
-  const stats = el("div", "", panel, "grid");
-  [["Legs with usable odds", verified.length], ["Odds missing / unverified", unknown.length], ["Naive combined implied chance", combined === null ? "Not calculable" : (combined * 100).toFixed(4) + "%"]].forEach(([label, value]) => {
+  const stats = el("div", "", panel, "lookup-summary");
+  [["Usable odds", verified.length], ["Unverified", unknown.length], ["Naive combined chance", combined === null ? "N/A" : (combined * 100).toFixed(3) + "%"]].forEach(([label, value]) => {
     const card = el("div", "", stats, "stat"); el("span", label, card); el("strong", String(value), card);
   });
-  if (combined !== null) el("p", "The combined figure is the product of individual implied probabilities under an independence assumption. It is not a calibrated accumulator forecast; correlated legs and bookmaker margin can make it misleading.", panel, "small notice");
-  const label = el("label", "Minimum individual implied probability to keep", panel);
+  if (combined !== null) {
+    const caveat = document.createElement("details"); caveat.className = "lookup-details";
+    const caveatSummary = document.createElement("summary"); caveatSummary.textContent = "About combined implied probability"; caveat.appendChild(caveatSummary);
+    el("p", "This figure multiplies individual implied probabilities under an independence assumption. It is not a calibrated accumulator forecast; correlated legs and bookmaker margin can make it misleading.", caveat, "small notice"); panel.appendChild(caveat);
+  }
+  const toolbar = el("div", "", panel, "filter-toolbar");
+  const label = el("label", "Minimum individual implied probability", toolbar);
   const select = document.createElement("select");
   [10, 20, 30, 40, 50, 60, 70].forEach(value => {
     const option = document.createElement("option"); option.value = String(value); option.textContent = value + "% or higher"; if (value === 70) option.selected = true; select.appendChild(option);
   });
   label.appendChild(select);
-  const summary = el("p", "", panel, "small");
+  const summary = el("div", "", toolbar, "filter-summary");
   const list = el("div", "", panel);
   function redraw() {
     clearChildren(list);
@@ -2202,31 +2244,37 @@ function renderTicketMathReview(data, parent) {
     summary.textContent = "Kept " + kept.length + " · filtered below threshold " + filtered.length + " · unverified odds " + unknown.length + ". Filter is a screening rule, not proof a selection is good.";
     if (!ranked.length) el("p", "No selections have verifiable decimal odds, so probability ranking is unavailable.", list, "warning");
     kept.forEach((leg, index) => {
-      const card = el("article", "", list, "item");
-      el("h4", (index + 1) + ". " + leg.event, card);
-      el("p", (leg.market || "Market unknown") + " — " + (leg.selection || "Selection unknown"), card);
-      el("p", "Odds " + Number(leg.odds).toFixed(3) + " · raw implied probability " + (leg.implied * 100).toFixed(2) + "%", card);
-      el("p", "Screen: retained at selected threshold; outcome still uncertain.", card, "small");
+      const card = el("article", "", list, "filtered-leg");
+      const info = el("div", "", card);
+      el("strong", (index + 1) + ". " + (leg.event || "Event unavailable"), info);
+      el("p", (leg.market || "Market unknown") + " · " + (leg.selection || "Selection unknown"), info);
+      el("p", "Retained at selected threshold", info);
+      el("span", Number(leg.odds).toFixed(3) + " · " + (leg.implied * 100).toFixed(2) + "%", card, "leg-metric");
     });
     if (filtered.length) {
-      el("h4", "Filtered out", list);
+      const removedDetails = document.createElement("details"); removedDetails.className = "lookup-details";
+      const removedSummary = document.createElement("summary"); removedSummary.textContent = "Filtered out · " + filtered.length + " selections (not included in output)"; removedDetails.appendChild(removedSummary);
       filtered.forEach(leg => {
-        const card = el("article", "", list, "item");
-        el("strong", leg.event, card);
-        el("p", (leg.market || "Market unknown") + " — " + (leg.selection || "Selection unknown") + " · " + (leg.implied * 100).toFixed(2) + "% implied", card);
-      });
+        const card = el("article", "", removedDetails, "filtered-leg"); const info = el("div", "", card);
+        el("strong", leg.event || "Event unavailable", info);
+        el("p", (leg.market || "Market unknown") + " · " + (leg.selection || "Selection unknown"), info);
+        el("span", (leg.implied * 100).toFixed(2) + "%", card, "leg-metric");
+      }); list.appendChild(removedDetails);
     }
-    unknown.forEach(leg => {
-      const card = el("article", "", list, "item");
-      el("strong", leg.event + " — not ranked", card);
-      el("p", "Odds or selected outcome could not be verified. No probability is fabricated.", card, "warning");
-    });
+    if (unknown.length) {
+      const unknownDetails = document.createElement("details"); unknownDetails.className = "lookup-details";
+      const unknownSummary = document.createElement("summary"); unknownSummary.textContent = "Unverified odds · " + unknown.length + " selections (not ranked)"; unknownDetails.appendChild(unknownSummary);
+      unknown.forEach(leg => { const row = el("article", "", unknownDetails, "filtered-leg"); el("strong", (leg.event || "Event unavailable") + " — not ranked", row); el("p", "Odds or selected outcome could not be verified. No probability is fabricated.", row, "small warning"); });
+      list.appendChild(unknownDetails);
+    }
   }
   select.addEventListener("change", redraw);
   redraw();
   // Automatically run the historical team-stat analysis after a successful ticket lookup.
   if (Array.isArray(data.legs) && data.legs.length) {
-    const autoPanel = el("section", "", parent, "panel");
+    const autoPanel = document.createElement("details"); autoPanel.className = "lookup-advanced";
+    const autoSummary = document.createElement("summary"); autoSummary.textContent = "Advanced statistical analysis · model estimates and transfer controls"; autoPanel.appendChild(autoSummary);
+    parent.appendChild(autoPanel);
     el("h3", "Automatic statistical analysis", autoPanel);
     const status = el("p", "Fetching recent results and home/away performance…", autoPanel, "small");
     const results = el("div", "", autoPanel);
@@ -2243,10 +2291,11 @@ function renderTicketMathReview(data, parent) {
         thresholdLabel.appendChild(thresholdSelect);
         const summary = el("p", "", autoPanel, "small");
         let currentKept = [];
-        const applyFilteredButton = el("button", "Use retained selections in converter", autoPanel);
+        const actionBar = el("div", "", panel, "lookup-action");
+        const applyFilteredButton = el("button", "Use retained selections in converter", actionBar);
         applyFilteredButton.type = "button";
         applyFilteredButton.disabled = true;
-        const applyFilteredNote = el("p", "Only retained, estimated selections will be carried forward. The original booking code is not retained as if it represented this changed ticket.", autoPanel, "small notice");
+        const applyFilteredNote = el("p", "Only retained, estimated selections will be carried forward. The original booking code is discarded when you apply the filtered set.", actionBar, "small notice");
         applyFilteredButton.addEventListener("click", () => {
           if (!currentKept.length || !lastLookupData || !Array.isArray(lastLookupData.legs)) return;
           const norm = value => String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
@@ -2892,7 +2941,7 @@ def main():
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
-    logging.info("SolveEase Booking & Arbitrage Dashboard v3.8.1 listening on port %s", PORT)
+    logging.info("SolveEase Booking & Arbitrage Dashboard v3.8.2 listening on port %s", PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

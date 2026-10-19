@@ -1,4 +1,4 @@
-# SolveEase Booking & Arbitrage Dashboard — v3.8.1
+# SolveEase Booking & Arbitrage Dashboard — v3.8.2
 
 A single, integrated, standard-library Python application for read-only booking analysis, ticket conversion checklists, odds scanning/arbitrage calculations, daily fixture screening, same-fixture ticket optimization, model diagnostics and optional Telegram alerts. It does **not** place bets or create valid bookmaker booking codes.
 
@@ -91,3 +91,8 @@ A probability value in a payload is not automatically verified simply because it
 - Arbitrage is only identified among accessible, equivalent, timely markets. Empty scans are not proof that no arbitrage exists. Settlement rules, limits, price movement and account restrictions can invalidate apparent opportunities.
 - Telegram is **not activated by this ZIP alone**. Add private credentials, deploy, press “Send test alert”, and verify the message arrives.
 - The ZIP cannot verify external feeds, live market availability, bookmaker coverage, or deployment credentials from the build environment. Those require post-deployment checks.
+
+
+## v3.8.2 compact booking and filter workspace
+
+The booking code entry and filter review now share one compact workspace. Original ticket details, filtered-out selections, unverified selections, and advanced statistical analysis are collapsed by default. Retained selections are shown as compact rows, with the filtered-ticket transfer action kept visible. The active original booking code is cleared when the filtered set is applied.
