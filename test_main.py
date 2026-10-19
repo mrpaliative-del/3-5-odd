@@ -68,6 +68,8 @@ class ScannerTests(unittest.TestCase):
         self.assertIn('$("code").value = "";', app.HTML)
         self.assertIn('Persist only the filtered output', app.HTML)
         self.assertIn("lookup-entry", app.HTML)
+        self.assertIn("Team statistics may be unavailable or the markets unsupported", app.HTML)
+        self.assertIn("could not be matched back to the ticket data", app.HTML)
         self.assertNotIn("renderTicketMathReview(data, box)", app.HTML)
         self.assertNotIn("Original ticket selections ·", app.HTML)
         self.assertNotIn("Filtered out ·", app.HTML)

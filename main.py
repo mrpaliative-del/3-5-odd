@@ -2,7 +2,7 @@
 """
 SolveEase Booking & Arbitrage Dashboard
 Python standard library only.
-Version: 3.8.4
+Version: 3.8.5
 
 Render start command:
     python main.py
@@ -2193,7 +2193,22 @@ async function lookup() {
     } catch (_) {}
     const output = $("ticketResult");
     if (!retainedSourceLegs.length) {
-      $("lookupMessage").textContent = "No selections met the 70% model threshold.";
+      // Explain why the filter produced no output without exposing any unfiltered ticket legs.
+      const received = Number(report.legs_received ?? source.legs.length);
+      const estimatedCount = estimated.length;
+      const belowCount = estimated.filter(leg => Number(leg.estimated_probability) < threshold).length;
+      const matchCount = kept.length - retainedSourceLegs.length;
+      let explanation;
+      if (estimatedCount === 0) {
+        explanation = `No selections shown: the model could not estimate any of ${received} selections. Team statistics may be unavailable or the markets unsupported; this does not mean all selections are bad.`;
+      } else if (belowCount === estimatedCount) {
+        explanation = `No selections shown: ${estimatedCount} selections were estimated, but none reached the 70% cutoff. The model is an uncalibrated baseline, not a guarantee.`;
+      } else if (matchCount > 0) {
+        explanation = `No selections shown: ${kept.length} selections passed the model cutoff, but could not be matched back to the ticket data. This is a matching issue, not a probability verdict.`;
+      } else {
+        explanation = `No selections shown: none of ${received} selections passed the 70% cutoff with a usable model estimate.`;
+      }
+      $("lookupMessage").textContent = explanation;
       $("lookupMessage").className = "warning";
       lastLookupData = null;
       return;
@@ -2546,7 +2561,7 @@ activatePage();
 # ---------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SolveEase/3.8.4"
+    server_version = "SolveEase/3.8.5"
 
     def log_message(self, fmt, *args):
         # Avoid logging query strings, POST bodies, and booking codes.
@@ -2643,7 +2658,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "status": "online",
                 "service": "SolveEase Booking & Arbitrage Dashboard",
-                "version": "3.8.4",
+                "version": "3.8.5",
                 "configured_feeds": configured,
                 "feed_status": feed_status,
                 "feed_freshness_threshold_seconds": STALE_AFTER_SECONDS,
@@ -2815,7 +2830,7 @@ def main():
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
-    logging.info("SolveEase Booking & Arbitrage Dashboard v3.8.4 listening on port %s", PORT)
+    logging.info("SolveEase Booking & Arbitrage Dashboard v3.8.5 listening on port %s", PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
