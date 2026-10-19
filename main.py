@@ -2,7 +2,7 @@
 """
 SolveEase Booking & Arbitrage Dashboard
 Python standard library only.
-Version: 3.8.6
+Version: 3.8.7
 
 Render start command:
     python main.py
@@ -2212,9 +2212,22 @@ async function lookup() {
       const estimatedCount = estimated.length;
       const belowCount = estimated.filter(leg => Number(leg.estimated_probability) < threshold).length;
       const matchCount = kept.length - retainedSourceLegs.length;
+      // Surface aggregated diagnostics, not ticket legs or team names, so users can tell
+      // whether the failure is statistics lookup, unsupported markets, or output matching.
+      const statusCounts = {};
+      const reasonCounts = {};
+      all.forEach(leg => {
+        const status = String(leg.status || "unknown");
+        statusCounts[status] = (statusCounts[status] || 0) + 1;
+        const reason = String(leg.reason || leg.stats?.reason || leg.method || "No reason supplied").trim();
+        if (reason) reasonCounts[reason] = (reasonCounts[reason] || 0) + 1;
+      });
+      const topReasons = Object.entries(reasonCounts).sort((a,b) => b[1]-a[1]).slice(0,2)
+        .map(([reason,count]) => `${count}× ${reason}`).join("; ");
+      const statusSummary = Object.entries(statusCounts).map(([status,count]) => `${status}: ${count}`).join(", ");
       let explanation;
       if (estimatedCount === 0) {
-        explanation = `No selections shown: the model could not estimate any of ${received} selections. Team statistics may be unavailable or the markets unsupported; this does not mean all selections are bad.`;
+        explanation = `No selections shown: 0/${received} selections were estimated. Diagnostics — ${statusSummary || "no per-selection statuses returned"}. ${topReasons ? "Main reasons: " + topReasons : "The analyzer returned no reason details."} No probability was invented.`;
       } else if (belowCount === estimatedCount) {
         explanation = `No selections shown: ${estimatedCount} selections were estimated, but none reached the 70% cutoff. The model is an uncalibrated baseline, not a guarantee.`;
       } else if (matchCount > 0) {
@@ -2575,7 +2588,7 @@ activatePage();
 # ---------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SolveEase/3.8.6"
+    server_version = "SolveEase/3.8.7"
 
     def log_message(self, fmt, *args):
         # Avoid logging query strings, POST bodies, and booking codes.
@@ -2672,7 +2685,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "status": "online",
                 "service": "SolveEase Booking & Arbitrage Dashboard",
-                "version": "3.8.6",
+                "version": "3.8.7",
                 "configured_feeds": configured,
                 "feed_status": feed_status,
                 "feed_freshness_threshold_seconds": STALE_AFTER_SECONDS,
@@ -2844,7 +2857,7 @@ def main():
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
-    logging.info("SolveEase Booking & Arbitrage Dashboard v3.8.6 listening on port %s", PORT)
+    logging.info("SolveEase Booking & Arbitrage Dashboard v3.8.7 listening on port %s", PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
