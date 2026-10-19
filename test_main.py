@@ -26,6 +26,9 @@ def market(bookmaker, over_odds, under_odds):
 
 
 class ScannerTests(unittest.TestCase):
+    def test_statistics_checks_three_seasons_for_coverage(self):
+        self.assertEqual(app._season_codes(__import__("datetime").date(2026, 10, 19)), ["2627", "2526", "2425"])
+
     def test_theoretical_arbitrage_is_found(self):
         rows = [market("sportybet", 2.20, 1.80), market("bet9ja", 2.05, 2.10)]
         self.assertTrue(app.find_arbitrage(rows))

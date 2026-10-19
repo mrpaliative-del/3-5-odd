@@ -241,7 +241,7 @@ def _selection_probability(market, selection, home_rate, away_rate):
 def _season_codes(today=None):
     today = today or datetime.now(timezone.utc).date()
     start = today.year if today.month >= 7 else today.year - 1
-    return [f"{start % 100:02d}{(start + 1) % 100:02d}", f"{(start - 1) % 100:02d}{start % 100:02d}"]
+    return [f"{start % 100:02d}{(start + 1) % 100:02d}", f"{(start - 1) % 100:02d}{start % 100:02d}", f"{(start - 2) % 100:02d}{(start - 1) % 100:02d}"]
 
 
 def _fetch_football_csv(season, division):
@@ -480,15 +480,25 @@ def fetch_match_statistics(event):
             return dict(cached[1])
     seasons = _season_codes()
     rows_by_division = {}
-    # Fetch current season first; only fetch last season for divisions with no current CSV
-    # or where both clubs cannot be matched. Parallel I/O keeps the mobile workflow bounded.
-    def fetch_division(division):
-        season = seasons[0]
-        content = _fetch_football_csv(season, division)
-        parsed = _csv_matches(content, division, season)
-        return division, parsed
+    # Fetch up to three seasons for every configured division. A single current-season
+    # file often has too few matches early in the season; combining seasons improves
+    # coverage while the freshness guard below still rejects stale datasets.
+    def fetch_division_seasons(division):
+        combined = []
+        for season in seasons:
+            content = _fetch_football_csv(season, division)
+            parsed = _csv_matches(content, division, season)
+            if parsed:
+                combined.extend(parsed)
+        # Deduplicate repeated rows if a source file contains duplicate fixtures.
+        unique = {}
+        for row in combined:
+            key = (row["date"], _team_key(row["home"]), _team_key(row["away"]))
+            unique[key] = row
+        return division, list(unique.values())
+
     with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = [pool.submit(fetch_division, division) for division in FOOTBALL_DIVISIONS]
+        futures = [pool.submit(fetch_division_seasons, division) for division in FOOTBALL_DIVISIONS]
         for future in as_completed(futures):
             try:
                 division, parsed = future.result()
@@ -496,6 +506,7 @@ def fetch_match_statistics(event):
                     rows_by_division[division] = parsed
             except Exception:
                 continue
+
     def select_league(rows_map):
         candidates = []
         for division, matches in rows_map.items():
@@ -505,25 +516,11 @@ def fetch_match_statistics(event):
             if hname and aname and _team_key(hname) != _team_key(aname):
                 hhist = _team_match_history(matches, hname)
                 ahist = _team_match_history(matches, aname)
-                # Need evidence for both clubs; a lone historical spelling match is not enough.
                 if len(hhist) >= 2 and len(ahist) >= 2:
                     candidates.append((len(hhist) + len(ahist), division, matches, hname, aname, hhist, ahist))
         return max(candidates, default=None, key=lambda item: item[0])
+
     chosen = select_league(rows_by_division)
-    if not chosen:
-        # Fall back to the previous season, where newly promoted / renamed teams may have data.
-        def fetch_previous(division):
-            return division, _csv_matches(_fetch_football_csv(seasons[1], division), division, seasons[1])
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            futures = [pool.submit(fetch_previous, division) for division in FOOTBALL_DIVISIONS]
-            for future in as_completed(futures):
-                try:
-                    division, parsed = future.result()
-                    if parsed:
-                        rows_by_division[division] = rows_by_division.get(division, []) + parsed
-                except Exception:
-                    continue
-        chosen = select_league(rows_by_division)
     if not chosen:
         result = {"ok": False, "status": "unmatched", "event": event,
                   "reason": "No supported league CSV contained enough recent results for both teams. No model probability was invented.",
@@ -533,12 +530,7 @@ def fetch_match_statistics(event):
             FOOTBALL_STATS_CACHE[cache_key] = (now, result)
         return result
     _, division, matches, home_name, away_name, home_history, away_history = chosen
-    # Enrich current-season form with last season for teams that have enough history.
-    previous_rows = [] if any(row["season"] == seasons[1] for row in matches) else _csv_matches(_fetch_football_csv(seasons[1], division), division, seasons[1])
-    if previous_rows:
-        matches = previous_rows + matches
-        home_history = _team_match_history(matches, home_name)
-        away_history = _team_match_history(matches, away_name)
+    # Histories already combine up to three seasons; recency sorting happens in the team summarizer.
     hsum, asum = _summarize_team(home_history), _summarize_team(away_history)
     league_rows = [row for row in matches if row["hg"] >= 0 and row["ag"] >= 0]
     league_home = _avg([row["hg"] for row in league_rows], 1.45)
@@ -2588,7 +2580,7 @@ activatePage();
 # ---------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SolveEase/3.8.7"
+    server_version = "SolveEase/3.8.8"
 
     def log_message(self, fmt, *args):
         # Avoid logging query strings, POST bodies, and booking codes.
@@ -2685,7 +2677,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "status": "online",
                 "service": "SolveEase Booking & Arbitrage Dashboard",
-                "version": "3.8.7",
+                "version": "3.8.8",
                 "configured_feeds": configured,
                 "feed_status": feed_status,
                 "feed_freshness_threshold_seconds": STALE_AFTER_SECONDS,
