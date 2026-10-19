@@ -2,7 +2,7 @@
 """
 SolveEase Booking & Arbitrage Dashboard
 Python standard library only.
-Version: 3.7.1
+Version: 3.8.0
 
 Render start command:
     python main.py
@@ -72,6 +72,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
+import advanced_features as advanced
+
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "10000"))
 TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "12"))
@@ -128,6 +130,7 @@ STATE_LOCK = threading.Lock()
 LAST_SCAN = None
 LAST_LOOKUP = None
 LAST_FEED_STATUS = None
+LAST_DAILY_REPORT = None
 
 
 def now_iso():
@@ -1797,6 +1800,9 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
   <a href="/recommendations" data-page="recommendations">Recommendations</a>
   <a href="/accumulator" data-page="accumulator">Accumulator</a>
   <a href="/status" data-page="status">Feed status</a>
+  <a href="/daily" data-page="daily">Daily builder</a>
+  <a href="/optimize" data-page="optimize">Ticket optimizer</a>
+  <a href="/alerts" data-page="alerts">Telegram alerts</a>
 </nav>
 
 <section id="homePage" class="page-section">
@@ -1812,7 +1818,10 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
     <article class="feature-card"><div class="eyebrow">03 · Markets</div><h2>Market scanner</h2><p>Check configured odds feeds and inspect usable market prices.</p><a class="feature-link" href="/scanner">Open scanner →</a></article>
     <article class="feature-card"><div class="eyebrow">04 · Analysis</div><h2>Recommendations</h2><p>Compare candidate markets and review concise probability and data-quality summaries.</p><a class="feature-link" href="/recommendations">Open recommendations →</a></article>
     <article class="feature-card"><div class="eyebrow">05 · Tickets</div><h2>Accumulator calculator</h2><p>Review combined odds and potential returns without mixing ticket maths with win predictions.</p><a class="feature-link" href="/accumulator">Open calculator →</a></article>
-    <article class="feature-card"><div class="eyebrow">04 · Monitoring</div><h2>Feed and service status</h2><p>Inspect configured feeds, response health, freshness and the last scan report.</p><a class="feature-link" href="/status">Open status →</a></article>
+    <article class="feature-card"><div class="eyebrow">06 · Daily</div><h2>Daily accumulator builder</h2><p>Filter today’s upcoming fixtures using the 70% estimate and evidence-quality gate. Never lower the threshold to fill a ticket.</p><a class="feature-link" href="/daily">Build daily scan →</a></article>
+    <article class="feature-card"><div class="eyebrow">07 · Optimization</div><h2>Booking optimizer</h2><p>Compare original selections with same-fixture alternatives; retain, replace or exclude transparently.</p><a class="feature-link" href="/optimize">Optimize ticket →</a></article>
+    <article class="feature-card"><div class="eyebrow">08 · Monitoring</div><h2>Telegram alerts</h2><p>Test configured Telegram delivery and send readable daily scan summaries.</p><a class="feature-link" href="/alerts">Configure alerts →</a></article>
+    <article class="feature-card"><div class="eyebrow">09 · Monitoring</div><h2>Feed and service status</h2><p>Inspect configured feeds, response health, freshness and the last scan report.</p><a class="feature-link" href="/status">Open status →</a></article>
   </div>
   <section class="panel"><h2>System snapshot</h2><div id="homeHealth">Checking service…</div><p class="small">A service being online does not mean every feed is configured, usable or current.</p></section>
 </section>
@@ -1833,7 +1842,9 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
 
 <section class="panel page-section" id="converterPanel">
   <h2>2. Bookmaker ticket converter</h2>
-  <p>Prepare a copyable checklist from a successfully retrieved ticket for manual recreation at another bookmaker.</p>
+  <p>Convert either a retrieved ticket or manually supplied ticket JSON into a copyable reconstruction checklist. This tool is independent of the prediction and arbitrage tools.</p>
+  <label for="manualTicketJson">Optional manual ticket JSON (use if you do not have a supported booking lookup)</label>
+  <textarea id="manualTicketJson" rows="6" placeholder='{"bookmaker":"Unknown source","legs":[{"event":"Home FC vs Away FC","market":"Double Chance","selection":"Home/Draw","odds":1.35}]}'></textarea>
   <label for="destinationBookmaker">Destination bookmaker</label>
   <select id="destinationBookmaker">
     <option value="sportybet">SportyBet</option>
@@ -1920,6 +1931,27 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
   <h3>Configured bookmaker feeds</h3><div id="statusFeedHealth"></div>
   <p class="small">Read-only tools. No automatic bet placement and no bookmaker login credentials requested. Odds and availability can change rapidly.</p>
 </section>
+<section class="panel page-section page-hidden" id="dailyPanel">
+  <div class="eyebrow">Daily fixtures</div><h2>Daily accumulator builder</h2>
+  <p>Use a configured HTTPS fixture feed, or paste fixture JSON below. Each fixture uses <code>event</code>, <code>start_time</code> (ISO-8601), and a <code>selections</code> array with estimated_probability and evidence_quality. Only upcoming fixtures in the selected local date are considered.</p>
+  <label for="dailyDate">Fixture date (local)</label><input id="dailyDate" placeholder="YYYY-MM-DD (blank = today)">
+  <label for="dailyFixtures">Fixture JSON (optional when FIXTURES_FEED_URL is configured)</label><textarea id="dailyFixtures" rows="8" placeholder='{"fixtures":[{"event":"Home FC vs Away FC","start_time":"2026-10-19T20:00:00+01:00","selections":[{"market":"Double Chance","selection":"Home/Draw","odds":1.35,"estimated_probability":0.74,"evidence_quality":"adequate","reasoning":"Model plus current verified stats"}]}]}'></textarea>
+  <div class="actions"><button onclick="runDailyBuilder()">Build today’s accumulator</button><button class="secondary" onclick="sendDailyTelegram()">Send report to Telegram</button></div><div id="dailyMessage" role="status" aria-live="polite"></div><pre id="dailyReport" class="item">No daily scan run yet.</pre>
+  <p class="small notice">The threshold is fixed at 70%; target 20 and maximum 40. If fewer qualify, the report shows the shortfall. No automatic bets are placed. Probability estimates are not guarantees.</p>
+</section>
+<section class="panel page-section page-hidden" id="optimizePanel">
+  <div class="eyebrow">Same-fixture replacement</div><h2>Booking lookup & intelligence optimizer</h2>
+  <p>Paste a JSON object with a <code>legs</code> array. Each leg can include an <code>original</code> selection and same-fixture <code>candidates</code>. A candidate must have estimated_probability ≥ 0.70 and adequate/high/verified evidence quality or calibrated=true.</p>
+  <label for="optimizerJson">Ticket analysis JSON</label><textarea id="optimizerJson" rows="9" placeholder='{"legs":[{"original":{"event":"Home FC vs Away FC","market":"1X2","selection":"Away","odds":2.6,"estimated_probability":0.48,"evidence_quality":"adequate"},"candidates":[{"event":"Home FC vs Away FC","market":"Double Chance","selection":"Home/Draw","odds":1.4,"estimated_probability":0.74,"evidence_quality":"adequate","reasoning":"Recent and longer form agree"}]}]}'></textarea>
+  <div class="actions"><button onclick="runOptimizer()">Analyze and optimize</button><button class="secondary" onclick="runPsychologyCheck()">Check decision biases</button></div><div id="optimizerMessage" role="status" aria-live="polite"></div><pre id="optimizerReport" class="item">No optimization run yet.</pre>
+  <p class="small notice">Only genuinely supplied candidates are considered. “No qualifying alternative found” is an allowed result. This tool does not generate booking codes or place bets.</p>
+</section>
+<section class="panel page-section page-hidden" id="alertsPanel">
+  <div class="eyebrow">Monitoring</div><h2>Professional Telegram alerts</h2>
+  <p>Configure <code>TELEGRAM_BOT_TOKEN</code> and <code>TELEGRAM_CHAT_ID</code> in Render’s private environment variables. The bot token is never requested in this page or printed to logs.</p>
+  <div class="actions"><button onclick="testTelegram()">Send test alert</button><button class="secondary" onclick="checkTelegramStatus()">Check configuration status</button></div><div id="telegramMessage" role="status" aria-live="polite"></div><pre id="telegramReport" class="item">Telegram delivery has not been tested in this process.</pre>
+  <p class="small notice">A configured token does not prove delivery. Activation is confirmed only after a successful test message is received in the intended Telegram chat.</p>
+</section>
 <footer>SolveEase · Mobile-friendly · Manual confirmation required · No automatic bet placement</footer>
 </main>
 <script>
@@ -1950,15 +1982,15 @@ function restoreWorkspace() {
 function activatePage() {
   restoreWorkspace();
   const raw = location.pathname.replace(/\/$/, "") || "/";
-  const page = ({"/":"home","/lookup":"lookup","/converter":"converter","/scanner":"scanner","/recommendations":"recommendations","/accumulator":"accumulator","/status":"status"})[raw];
+  const page = ({"/":"home","/lookup":"lookup","/converter":"converter","/scanner":"scanner","/recommendations":"recommendations","/accumulator":"accumulator","/status":"status","/daily":"daily","/optimize":"optimize","/alerts":"alerts"})[raw];
   if (!page) { location.replace("/"); return; }
-  const map = {home:"homePage",lookup:"lookupPanel",converter:"converterPanel",scanner:"scannerPanel",recommendations:"recommendationsPanel",accumulator:"accumulatorPanel",status:"statusPanel"};
+  const map = {home:"homePage",lookup:"lookupPanel",converter:"converterPanel",scanner:"scannerPanel",recommendations:"recommendationsPanel",accumulator:"accumulatorPanel",status:"statusPanel",daily:"dailyPanel",optimize:"optimizePanel",alerts:"alertsPanel"};
   Object.entries(map).forEach(([key,id]) => $(id).classList.toggle("page-hidden", key !== page));
   document.querySelectorAll(".nav a").forEach(a => {
     if (a.dataset.page === page) a.setAttribute("aria-current","page");
     else a.removeAttribute("aria-current");
   });
-  const titles = {home:"Home",lookup:"Booking-code lookup",converter:"Ticket converter",scanner:"Market scanner",recommendations:"Market recommendations",accumulator:"Accumulator calculator",status:"Feed and service status"};
+  const titles = {home:"Home",lookup:"Booking-code lookup",converter:"Ticket converter",scanner:"Market scanner",recommendations:"Market recommendations",accumulator:"Accumulator calculator",status:"Feed and service status",daily:"Daily accumulator builder",optimize:"Booking optimizer",alerts:"Telegram alerts"};
   document.title = "SolveEase | " + titles[page];
   if (page === "home" || page === "status") loadHealth();
   if (page === "converter") restoreLookup();
@@ -2260,7 +2292,15 @@ function renderTicketMathReview(data, parent) {
 function clearChildren(node) { node.replaceChildren(); }
 
 function prepareConversion() {
-  const data = lastLookupData;
+  let data = lastLookupData;
+  const manualText = $("manualTicketJson") ? $("manualTicketJson").value.trim() : "";
+  if (manualText) {
+    try {
+      const manual = JSON.parse(manualText);
+      if (manual && Array.isArray(manual.legs)) data = {...manual, ok:true, bookmaker:manual.bookmaker || "User-supplied ticket", retrieved_at:"Manual input", legs:manual.legs.map(leg => ({...leg, odds_verified:Number.isFinite(Number(leg.odds)) && Number(leg.odds)>1}))};
+      else { $("converterMessage").textContent = "Manual JSON must contain a legs array."; $("converterMessage").className="error"; return; }
+    } catch (_) { $("converterMessage").textContent = "Manual ticket JSON is invalid."; $("converterMessage").className="error"; return; }
+  }
   const destination = $("destinationBookmaker").value;
   const names = {sportybet:"SportyBet",bet9ja:"Bet9ja",betking:"BetKing"};
   const message = $("converterMessage");
@@ -2269,7 +2309,7 @@ function prepareConversion() {
   preparedTicketText = "";
 
   if (!data || data.ok !== true || !Array.isArray(data.legs) || !data.legs.length) {
-    message.textContent = "Look up a supported booking code successfully first.";
+    message.textContent = "Enter manual ticket JSON or look up a supported booking code first.";
     message.className = "warning";
     output.textContent = "No ticket available to reconstruct.";
     return;
@@ -2524,6 +2564,19 @@ function clearBetslipAnalysis() {
   clear("betslipAnalysisReport");
 }
 
+async function runDailyBuilder() {
+  const message=$("dailyMessage"), report=$("dailyReport"); message.textContent="Scanning fixture data…";
+  let body={date:$('dailyDate').value.trim()||null}; const raw=$('dailyFixtures').value.trim();
+  if(raw){try{const parsed=JSON.parse(raw); body.fixtures=Array.isArray(parsed)?parsed:(parsed.fixtures||parsed.events||[]);}catch(e){message.textContent="Fixture JSON is invalid.";message.className="error";return;}}
+  try{const data=await api('/api/daily-accumulator','POST',body); report.textContent=JSON.stringify(data,null,2);message.textContent=data.status||'Daily scan complete.';message.className='success';}
+  catch(e){message.textContent=e.message;message.className='error';}
+}
+async function sendDailyTelegram(){const message=$("dailyMessage"),raw=$("dailyReport").textContent;try{const report=JSON.parse(raw);const data=await api('/api/telegram-alert','POST',{report});message.textContent=data.delivered?'Telegram report delivered.':(data.error||'Telegram delivery not confirmed.');message.className=data.delivered?'success':'warning';}catch(e){message.textContent='Run a daily scan first, then send its report.';message.className='warning';}}
+async function runOptimizer(){const message=$("optimizerMessage");try{const payload=JSON.parse($('optimizerJson').value);const data=await api('/api/optimize-ticket','POST',payload);$('optimizerReport').textContent=JSON.stringify(data,null,2);message.textContent='Optimization complete; review replacements and exclusions.';message.className='success';}catch(e){message.textContent=e.message;message.className='error';}}
+async function runPsychologyCheck(){const message=$("optimizerMessage");try{const payload=JSON.parse($('optimizerJson').value);const legs=payload.legs||[];const data=await api('/api/psychology-check','POST',{selections:legs.flatMap(x=>[x.original||x,...(x.candidates||[])])});$('optimizerReport').textContent=JSON.stringify(data,null,2);message.textContent='Diagnostic flags generated; probabilities were not changed.';message.className='success';}catch(e){message.textContent=e.message;message.className='error';}}
+async function testTelegram(){const message=$("telegramMessage");message.textContent='Sending test alert…';try{const data=await api('/api/telegram-test','POST',{});$('telegramReport').textContent=JSON.stringify(data,null,2);message.textContent=data.delivered?'Test alert delivered; check the configured Telegram chat.':(data.error||'Delivery not confirmed.');message.className=data.delivered?'success':'warning';}catch(e){message.textContent=e.message;message.className='error';}}
+async function checkTelegramStatus(){try{const data=await api('/api/telegram-status');$('telegramReport').textContent=JSON.stringify(data,null,2);$('telegramMessage').textContent=data.configured?'Credentials are present; delivery still needs a test.':'Telegram is not configured.';$('telegramMessage').className=data.configured?'warning':'error';}catch(e){$('telegramMessage').textContent=e.message;}}
+
 async function loadHealth() {
   try {
     const data = await api("/health");
@@ -2599,14 +2652,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         path = urlsplit(self.path).path
-        if path.rstrip("/") in ("", "/lookup", "/converter", "/scanner", "/recommendations", "/accumulator", "/status"):
+        if path.rstrip("/") in ("", "/lookup", "/converter", "/scanner", "/recommendations", "/accumulator", "/status", "/daily", "/optimize", "/alerts"):
             self.send_bytes(200, HTML.encode("utf-8"), "text/html; charset=utf-8")
         else:
             self.send_json(200, {"status": "online"})
 
     def do_GET(self):
         path = urlsplit(self.path).path.rstrip("/") or "/"
-        if path in ("/", "/lookup", "/converter", "/scanner", "/recommendations", "/accumulator", "/status"):
+        if path in ("/", "/lookup", "/converter", "/scanner", "/recommendations", "/accumulator", "/status", "/daily", "/optimize", "/alerts"):
             self.send_bytes(200, HTML.encode("utf-8"), "text/html; charset=utf-8")
             return
         if path == "/favicon.ico":
@@ -2636,7 +2689,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "status": "online",
                 "service": "SolveEase Booking & Arbitrage Dashboard",
-                "version": "3.7.1",
+                "version": "3.8.0",
                 "configured_feeds": configured,
                 "feed_status": feed_status,
                 "feed_freshness_threshold_seconds": STALE_AFTER_SECONDS,
@@ -2648,13 +2701,18 @@ class Handler(BaseHTTPRequestHandler):
                 "last_scan": last_scan,
                 "last_lookup": last_lookup,
                 "uptime_seconds": int(time.time() - STARTED_AT),
+                "daily_accumulator": {"threshold": 0.70, "target": 20, "maximum": 40, "timezone": os.environ.get("APP_TIMEZONE", "Africa/Lagos")},
+                "telegram_configured": bool(os.environ.get("TELEGRAM_BOT_TOKEN", "").strip() and os.environ.get("TELEGRAM_CHAT_ID", "").strip()),
             })
+            return
+        if path == "/api/telegram-status":
+            self.send_json(200, {"ok": True, "configured": bool(os.environ.get("TELEGRAM_BOT_TOKEN", "").strip() and os.environ.get("TELEGRAM_CHAT_ID", "").strip()), "delivery_tested": False, "note": "Configuration presence is not proof of message delivery."})
             return
         self.send_json(404, {"ok": False, "error": "Route not found"})
 
     def do_POST(self):
         path = urlsplit(self.path).path
-        if path not in ("/api/lookup", "/api/scan", "/api/analyze-betslip", "/api/analyze-ticket"):
+        if path not in ("/api/lookup", "/api/scan", "/api/analyze-betslip", "/api/analyze-ticket", "/api/daily-accumulator", "/api/optimize-ticket", "/api/psychology-check", "/api/telegram-test", "/api/telegram-alert", "/api/model-probability", "/api/calibration-metrics"):
             self.send_json(404, {"ok": False, "error": "Route not found"})
             return
         if "application/json" not in self.headers.get("Content-Type", "").lower():
@@ -2668,6 +2726,53 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             self.send_json(400, {"ok": False, "error": "Expected JSON object"})
             return
+
+        if path == "/api/daily-accumulator":
+            try:
+                fixtures = body.get("fixtures")
+                source = "request payload"
+                if fixtures is None:
+                    fetched = advanced.fetch_fixture_feed()
+                    if not fetched.get("ok"):
+                        self.send_json(503, fetched); return
+                    fixtures = fetched["fixtures"]; source = fetched.get("source", "configured feed")
+                result = advanced.build_daily_accumulator(fixtures, local_date=body.get("date"), timezone_name=body.get("timezone") or os.environ.get("APP_TIMEZONE", "Africa/Lagos"))
+                result["fixture_source"] = source
+                with STATE_LOCK:
+                    global LAST_DAILY_REPORT
+                    LAST_DAILY_REPORT = result
+                self.send_json(200, result)
+            except ValueError as exc: self.send_json(400, {"ok":False,"error":str(exc)})
+            except Exception:
+                logging.exception("Daily accumulator build failed")
+                self.send_json(500, {"ok":False,"error":"Daily scan failed safely; no fixtures or selections were invented."})
+            return
+        if path == "/api/optimize-ticket":
+            try: self.send_json(200, advanced.optimize_ticket(body.get("legs"), threshold=0.70))
+            except ValueError as exc: self.send_json(400, {"ok":False,"error":str(exc)})
+            return
+        if path == "/api/psychology-check":
+            selections = body.get("selections", [])
+            if not isinstance(selections, list): self.send_json(400,{"ok":False,"error":"selections must be a list"}); return
+            self.send_json(200,{"ok":True,"diagnostic_only":True,"results":[{"event":s.get("event","Unknown fixture"),"flags":advanced.psychology_flags(s)} for s in selections if isinstance(s,dict)],"note":"Flags do not alter probabilities and are not claims about a person's mental state."})
+            return
+        if path == "/api/model-probability":
+            try:
+                probability, method = advanced.market_probability(body.get("market", ""), body.get("selection", ""), body.get("home_goal_rate"), body.get("away_goal_rate"), body.get("rho", -0.08))
+                self.send_json(200, {"ok": probability is not None, "estimated_probability": probability, "method": method, "calibrated": False, "note": "Dixon-Coles rho must be fitted on training data and probabilities calibrated out-of-sample before production confidence claims."})
+            except ValueError as exc: self.send_json(400,{"ok":False,"error":str(exc)})
+            return
+        if path == "/api/calibration-metrics":
+            try: self.send_json(200, {"ok":True, **advanced.calibration_metrics(body.get("predictions"), body.get("outcomes"))})
+            except ValueError as exc: self.send_json(400,{"ok":False,"error":str(exc)})
+            return
+        if path == "/api/telegram-test":
+            result = advanced.telegram_send("SolveEase · Telegram test alert\nDelivery is confirmed only if this message appears in the intended chat.")
+            self.send_json(200,result); return
+        if path == "/api/telegram-alert":
+            report = body.get("report")
+            if not isinstance(report,dict): self.send_json(400,{"ok":False,"error":"report object required"}); return
+            result=advanced.telegram_send(advanced.format_daily_alert(report)); self.send_json(200,result); return
 
         if path == "/api/analyze-ticket":
             try:
@@ -2756,7 +2861,7 @@ def main():
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
-    logging.info("SolveEase Booking & Arbitrage Dashboard v3.7.1 listening on port %s", PORT)
+    logging.info("SolveEase Booking & Arbitrage Dashboard v3.8.0 listening on port %s", PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

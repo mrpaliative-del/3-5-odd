@@ -233,3 +233,63 @@ class ScannerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+class AdvancedFeatureTests(unittest.TestCase):
+    def test_dixon_coles_matrix_normalizes(self):
+        matrix = app.advanced.dc_score_matrix(1.4, 1.1)
+        self.assertAlmostEqual(sum(sum(row) for row in matrix), 1.0, places=10)
+
+    def test_bayesian_shrinkage_returns_bounded_rates(self):
+        result = app.advanced.shrink_goal_rates(5, 3, 2, 4, 3, 3)
+        self.assertGreaterEqual(result["home_goal_rate"], .15)
+        self.assertLessEqual(result["home_goal_rate"], 4.5)
+
+    def test_calibration_metrics_on_known_sample(self):
+        result = app.advanced.calibration_metrics([.8, .2], [1, 0])
+        self.assertEqual(result["n"], 2)
+        self.assertAlmostEqual(result["brier_score"], .04)
+
+    def test_probability_threshold_and_evidence_gate(self):
+        self.assertTrue(app.advanced.eligible_selection({"estimated_probability": .70, "evidence_quality": "adequate"}))
+        self.assertFalse(app.advanced.eligible_selection({"estimated_probability": .99, "evidence_quality": "unknown"}))
+        self.assertFalse(app.advanced.eligible_selection({"estimated_probability": .69, "evidence_quality": "high"}))
+
+    def test_optimizer_replaces_only_with_qualifying_candidate(self):
+        result = app.advanced.optimize_ticket([{"original":{"event":"A vs B","selection":"Away","estimated_probability":.4,"evidence_quality":"adequate"},"candidates":[{"event":"A vs B","selection":"Home/Draw","estimated_probability":.74,"evidence_quality":"adequate"}]}])
+        self.assertEqual(len(result["replacements"]), 1)
+        self.assertEqual(result["qualifying_count"], 1)
+
+    def test_optimizer_excludes_when_no_candidate_qualifies(self):
+        result = app.advanced.optimize_ticket([{"original":{"event":"A vs B","estimated_probability":.4,"evidence_quality":"adequate"},"candidates":[]}])
+        self.assertEqual(result["qualifying_count"], 0)
+        self.assertIn("No qualifying alternative found", result["exclusions"][0]["reason"])
+
+    def test_daily_builder_filters_date_started_games_and_threshold(self):
+        from datetime import datetime, timezone
+        now = datetime(2026, 10, 19, 10, 0, tzinfo=timezone.utc)
+        fixtures = [
+            {"event":"Upcoming","start_time":"2026-10-19T15:00:00+01:00","selections":[{"market":"DC","selection":"1X","odds":1.3,"estimated_probability":.72,"evidence_quality":"adequate"}]},
+            {"event":"Started","start_time":"2026-10-19T10:00:00+01:00","selections":[{"estimated_probability":.9,"evidence_quality":"high"}]},
+            {"event":"Low confidence","start_time":"2026-10-19T16:00:00+01:00","selections":[{"estimated_probability":.69,"evidence_quality":"high"}]},
+            {"event":"Tomorrow","start_time":"2026-10-20T15:00:00+01:00","selections":[{"estimated_probability":.8,"evidence_quality":"high"}]},
+        ]
+        report = app.advanced.build_daily_accumulator(fixtures, local_date="2026-10-19", timezone_name="Africa/Lagos", now=now)
+        self.assertEqual(report["qualifying_count"], 1)
+        self.assertEqual(report["shortfall"], 19)
+        self.assertEqual(report["selections"][0]["event"], "Upcoming")
+
+    def test_psychology_flags_are_diagnostic_only(self):
+        flags = app.advanced.psychology_flags({"event":"Famous FC", "reasoning":"big club and must-win; due a win"})
+        names = {x["flag"] for x in flags}
+        self.assertIn("reputation_bias_check", names)
+        self.assertIn("narrative_bias_check", names)
+        self.assertIn("gambler_fallacy_or_chasing", names)
+
+    def test_overround_removal_requires_complete_odds(self):
+        result = app.advanced.remove_overround([2.0, 2.0])
+        self.assertAlmostEqual(sum(result["margin_removed_probabilities"]), 1.0)
+        self.assertFalse(app.advanced.remove_overround([2.0, None])["ok"])
+
+    def test_dashboard_has_advanced_routes_and_alert_controls(self):
+        for fragment in ("dailyPanel", "optimizePanel", "alertsPanel", "/api/daily-accumulator", "/api/telegram-test", "/api/model-probability", "/api/calibration-metrics"):
+            self.assertIn(fragment, app.HTML if fragment in app.HTML else Path(__file__).with_name("main.py").read_text())

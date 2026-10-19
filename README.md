@@ -1,130 +1,92 @@
-# SolveEase Booking & Arbitrage Dashboard v3.7.1
+# SolveEase Booking & Arbitrage Dashboard — v3.8.0
 
-A mobile-friendly, read-only football odds dashboard using **Python standard library only**. No third-party Python packages are required. It does not log in to bookmakers or place bets.
+A single, integrated, standard-library Python application for read-only booking analysis, ticket conversion checklists, odds scanning/arbitrage calculations, daily fixture screening, same-fixture ticket optimization, model diagnostics and optional Telegram alerts. It does **not** place bets or create valid bookmaker booking codes.
 
-## Features
+## Included in this one repository/ZIP
 
-- Responsive dashboard, SportyBet booking lookup, and manual ticket reconstruction checklist.
-- Configurable odds-feed adapters and source-health diagnostics.
-- Theoretical two-outcome arbitrage comparison across matching normalized markets.
-- Feed-supplied probability filter (default 60%); supplied estimates are not independently verified.
-- Accumulator odds arithmetic.
-- **Automatic booking-ticket analysis:** after a successful ticket lookup, the dashboard independently ranks the ticket legs, fetches historical results where available, estimates home/away goal rates, calculates supported market probabilities, and lets the user filter on a model-probability threshold. The original ticket is preserved.
-- **Automatic team data:** fetches Football-Data.co.uk CSV results for configured major divisions and attempts Understat xG/xGA for supported leagues. It reports source, last result date, sample sizes, xG availability and reasons for unavailable estimates. Cache is in-memory; no third-party Python packages are required.
-- **Manual JSON analysis remains supported:** goal-rate fields are optional; when omitted, the app attempts automatic stats retrieval. Supported markets are 1X2, common double-chance selections, totals with a numeric line, and BTTS.
-- JSON one-shot scan mode for scheduled automation (`SCAN_ONCE=1`).
-- Standard-library `unittest` suite.
+- **Booking lookup & intelligence:** existing read-only SportyBet lookup adapter; analysis of supplied ticket legs; clear unsupported-source messaging. Bet9ja/BetKing lookup adapters are not implemented and are not guessed.
+- **Same-fixture optimization:** compare an original selection with supplied alternatives for the same fixture; retain, replace or exclude; qualifying candidates must have estimated probability at least 70% and adequate/high/verified evidence quality or `calibrated: true`.
+- **Daily accumulator builder:** local date defaults to `Africa/Lagos`; filters past/started fixtures and other dates; target 20, maximum 40, one selection per fixture; if fewer qualify it reports the shortfall and never lowers the 70% gate.
+- **Probability/model tools:** existing goal-rate/Poisson analysis plus an explicit Dixon–Coles score matrix helper, Bayesian-style shrinkage helper, implied probability/overround removal, and Brier/log-loss calculator. Dixon–Coles rho and all model outputs remain uncalibrated until fitted and validated on suitable out-of-sample data.
+- **Psychological decision checks:** diagnostic flags for recency, reputation, narrative, chasing/gambler's fallacy, timestamped odds movement availability, and consensus availability. These flags do not change probability estimates and do not claim to read minds.
+- **Independent tool pages:** lookup, manual converter, market/arbitrage scanner, recommendations, accumulator maths, daily builder, ticket optimizer, Telegram alerts, and feed/service status.
+- **Telegram:** test message and daily report endpoints with readable summaries, bounded message length, safe handling of tokens, and explicit distinction between configuration and confirmed delivery.
+- **Diagnostics:** health route, feed health/freshness reporting, standard-library tests, and explicit source/data limitations.
 
 ## Run locally
 
 ```bash
-python -m unittest -v
-python -m py_compile main.py test_main.py
 python main.py
 ```
 
-Open `http://127.0.0.1:10000` unless `PORT` is set to another value.
+The app listens on `0.0.0.0:$PORT` (default `10000`). Run tests with:
+
+```bash
+python -m py_compile main.py advanced_features.py test_main.py
+python -m unittest -v
+```
 
 ## Render deployment
 
-- Runtime: Python 3.11 or newer
-- Build command: `pip install -r requirements.txt` (no third-party dependencies are installed)
+- Build command: leave blank (no third-party dependencies).
 - Start command: `python main.py`
-- Set `PORT` only if your hosting platform does not supply it.
+- Health-check path: `/health`
+- Set the variables in `.env.example` in Render's private Environment page as needed. Never commit live tokens.
 
-## Environment variables
+## Optional variables
 
-Copy `.env.example` into your local private environment if needed. Do not commit real feed credentials or private URLs.
+- `FIXTURES_FEED_URL`: HTTPS JSON feed you are permitted to access. JSON may be a list of fixtures or an object containing `fixtures`/`events`. Each fixture should contain `event`, ISO-8601 `start_time`, optional `event_id`, and `selections`.
+- `APP_TIMEZONE`: IANA timezone, default `Africa/Lagos`.
+- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`: private Telegram bot credentials. Obtain the token from Telegram's official BotFather, and use the target private chat/group ID. Do not paste tokens into chat or source control.
+- `FOOTBALL_STATS_ENABLED`, `FOOTBALL_STATS_TIMEOUT_SECONDS`, `FOOTBALL_STATS_CACHE_TTL_SECONDS`, `FOOTBALL_STATS_MAX_AGE_DAYS`: existing best-effort historic data configuration.
+- `SPORTYBET_ODDS_FEED_URL`, `BET9JA_ODDS_FEED_URL`, `ONEXBET_ODDS_FEED_URL`, `BETWAY_ODDS_FEED_URL`: authorized structured odds feeds. A configured URL is not proof the source is official, accessible, current or complete.
 
-- `PORT` — HTTP port (default `10000`)
-- `REQUEST_TIMEOUT_SECONDS` — outbound request timeout (default `12`)
-- `MIN_PROBABILITY` — minimum feed-supplied probability (default `0.60`)
-- `BANKROLL` — displayed configuration only; does not promise returns (default `100000`)
-- `FEED_STALE_AFTER_SECONDS` — stale timestamp threshold (default `300`)
-- `SPORTYBET_ODDS_FEED_URL`
-- `BET9JA_ODDS_FEED_URL`
-- `ONEXBET_ODDS_FEED_URL` (legacy alias `X1BET_ODDS_FEED_URL` also accepted)
-- `BETWAY_ODDS_FEED_URL`
-- `FOOTBALL_STATS_ENABLED` — `1` by default; set `0` to disable automatic team-stat lookup
-- `FOOTBALL_STATS_TIMEOUT_SECONDS` — per-source HTTP timeout, default `5`
-- `FOOTBALL_STATS_CACHE_TTL_SECONDS` — process-local result cache, default `21600` (6 hours)
-- `FOOTBALL_STATS_MAX_AGE_DAYS` — reject statistics older than this, default `540`
+## API quick reference
 
-Only configure feeds you own or are authorized to access. A configured URL does not prove a feed is live, current, or accurate. Never place bookmaker passwords or account credentials in feed settings.
+- `GET /health` — service and feed status.
+- `POST /api/lookup` — `{ "code": "...", "bookmaker": "auto" }`.
+- `POST /api/scan` — scan configured odds feeds.
+- `POST /api/analyze-ticket` / `POST /api/analyze-betslip` — existing ticket model analysis.
+- `POST /api/daily-accumulator` — optional `{ "date": "YYYY-MM-DD", "timezone": "Africa/Lagos", "fixtures": [...] }`; if fixtures are omitted, uses `FIXTURES_FEED_URL`.
+- `POST /api/optimize-ticket` — `{ "legs": [{ "original": {...}, "candidates": [...] }] }`.
+- `POST /api/psychology-check` — `{ "selections": [...] }`.
+- `POST /api/model-probability` — `{ "market": "1X2", "selection": "Home", "home_goal_rate": 1.6, "away_goal_rate": 1.0 }`.
+- `POST /api/calibration-metrics` — `{ "predictions": [0.7, 0.3], "outcomes": [1, 0] }`.
+- `GET /api/telegram-status`, `POST /api/telegram-test`, `POST /api/telegram-alert`.
 
-## Routes
+All POST endpoints require `Content-Type: application/json`.
 
-- `/` — home
-- `/lookup` — read-only SportyBet ticket lookup
-- `/converter` — manual ticket reconstruction checklist
-- `/scanner` — odds scan, theoretical arbitrage, probability candidates, betslip analysis and accumulator maths
-- `/status` — source/service diagnostics
-- `/health` — JSON health status
-- `POST /api/lookup` — JSON body: `{"code":"...","bookmaker":"auto"}`
-- `POST /api/scan` — JSON body: `{}`
-- `POST /api/analyze-betslip` — JSON body shown below; goal-rate fields are optional
-- `POST /api/analyze-ticket` — analyzes the legs from a retrieved ticket using automatic stats lookup where possible
-
-### Selected betslip analysis API
+## Fixture payload example
 
 ```json
 {
-  "legs": [
+  "fixtures": [
     {
-      "event": "Alpha FC vs Beta FC",
-      "market": "1X2",
-      "selection": "Home",
-      "odds": 2.1
-    },
-    {
-      "event": "Alpha FC vs Beta FC",
-      "market": "Total Goals 2.5",
-      "selection": "Over 2.5",
-      "odds": 1.9
+      "event_id": "fixture-123",
+      "event": "Home FC vs Away FC",
+      "start_time": "2026-10-20T19:00:00+01:00",
+      "selections": [
+        {
+          "market": "Double Chance",
+          "selection": "Home/Draw",
+          "odds": 1.35,
+          "estimated_probability": 0.74,
+          "evidence_quality": "adequate",
+          "reasoning": "Model and current verified statistics agree"
+        }
+      ]
     }
   ]
 }
 ```
 
-When `home_goal_rate` and `away_goal_rate` are omitted, the API attempts to fetch historical results and team form from Football-Data.co.uk for supported major divisions. For supported top leagues it also attempts Understat team xG/xGA via its public JSON endpoint. If xG cannot be matched or retrieved, the model falls back to goal-derived rates using recent form, home/away scoring and conceding, league averages, and shrinkage for small venue samples. It never fills a missing match with invented stats.
+A probability value in a payload is not automatically verified simply because it is present. Integrators should only supply model estimates with transparent provenance and an evidence-quality label backed by actual evidence. This project does not fabricate missing odds, fixtures, probabilities or source coverage.
 
-The independent-Poisson calculation is still a baseline, not a trained or historically calibrated prediction. The result-derived goal rates are **not official xG**. Understat coverage is limited, and its endpoint may change or block access. Team matching can fail for reserve, youth, women's, renamed or neutral-site fixtures. Unsupported markets return no probability. The model assumes independent team goal counts and truncates the goal distribution at 12 goals before normalization. It does not calculate accumulator win probability because selections may be correlated.
+## Important limitations and responsible use
 
-**Data-use note:** Football-Data.co.uk states its free downloadable data is intended for private individual use, not commercial automated products. Check its current terms before using this adapter in a public/commercial service. Understat access is best-effort and its current terms and usage restrictions should also be checked before public or commercial reuse. Do not treat these sources as licensed commercial feeds without confirming permission.
-
-## Arbitrage and accumulator limitations
-
-Arbitrage results are theoretical. Verify exact event, line, market settlement, void rules, odds freshness, limits, fees, and mutually exclusive/exhaustive outcomes. A displayed theoretical margin is not a guarantee that all legs can be placed at the displayed prices. Accumulator arithmetic is not a forecast and does not account for correlation, bookmaker margin, price movement or settlement terms.
-
-## Scheduled scan
-
-`.github/workflows/run_scanner.yml` runs `python main.py` with `SCAN_ONCE=1`, which prints one scan as JSON and exits. Configure repository Actions secrets named `SPORTYBET_ODDS_FEED_URL`, `BET9JA_ODDS_FEED_URL`, `ONEXBET_ODDS_FEED_URL`, and/or `BETWAY_ODDS_FEED_URL` for the feeds you are authorized to use. If none are configured, the job correctly reports all sources as not configured; it cannot discover odds by itself. The workflow does not send Telegram alerts.
-
-## Source adapters and evidence limits
-
-- SportyBet booking lookup uses an unofficial endpoint that may change.
-- SportyBet nested factsCenter schema is unofficial and can change.
-- Bet9ja's public MarketWS XML operation has not been verified against a complete current live quote payload. The adapter rejects unclear fields rather than guessing odds.
-- 1xBet's endpoint and schema are unofficial; anti-bot or HTML responses are rejected.
-- The Betway adapter supports a documented flat-array fixture, but that fixture does not prove a Nigeria feed works.
-- The latest scan exposes up to 250 normalized two-outcome markets for user selection. The scanner currently normalizes two-outcome markets only. Three-way 1X2 feeds are excluded from the existing arbitrage scanner; the separate betslip model can estimate 1X2 when automatic team statistics match, or when goal rates are entered manually.
-- Missing, stale, or unusable feed data is not evidence that no opportunity exists.
-
-## Validation status
-
-Run the tests locally with `python -m unittest -v`. Tests use synthetic fixtures and mathematical examples; they verify code behavior, not live bookmaker access or betting profitability. Live feeds have not been confirmed by this package. After deployment, inspect `/health` and the scan diagnostics to establish which configured sources actually respond and provide usable data.
-
-
-
-## v3.7.1 interface improvements
-
-- Dedicated routes for Home, Booking lookup, Ticket converter, Market scanner, Market recommendations, Accumulator calculator, and Feed status.
-- Separate recommendation and accumulator workspaces so the scanner no longer holds every task on one long page.
-- Clear cross-navigation links, active-page state, compact mobile-first styling, keyboard focus indicators, and concise statistical-analysis guidance.
-- The analysis model and source limitations remain unchanged; UI separation does not itself improve probability accuracy or market-feed coverage.
-
-## v3.7.0 automatic team-stat analysis
-
-After a successful booking-code lookup, the UI automatically calls `POST /api/analyze-ticket`. It attempts to match each fixture against supported league CSV results, adds previous-season results where available, summarizes recent form and home/away goal rates, and tries Understat xG/xGA for selected leagues. Supported market probabilities are computed from the goal-rate model and ranked by estimated edge, then probability. The user can filter by minimum model probability; filtered and unavailable legs remain visible in separate sections. The retrieved booking is never rewritten.
-
-No live provider response was verified during packaging because outbound DNS/network access was unavailable in the build environment. Automated tests use synthetic fixtures and mocked provider results. The first deployed lookup is the real integration check: `/health` reports whether stats are enabled, and each analysis card reports the source, latest result date and whether xG was available.
+- A 70% estimate is not a guarantee and does not mean the accumulator itself has a 70% chance. Multi-leg outcomes are dependent in some cases; the displayed independence product is explicitly naive.
+- A 20-leg accumulator has low combined probability even when each leg's individual estimate is high. This app does not encourage staking or automatically execute bets.
+- Data-source terms/licensing must be checked before commercial use. Football-Data and Understat coverage is best-effort and may be subject to terms that restrict commercial use.
+- Arbitrage is only identified among accessible, equivalent, timely markets. Empty scans are not proof that no arbitrage exists. Settlement rules, limits, price movement and account restrictions can invalidate apparent opportunities.
+- Telegram is **not activated by this ZIP alone**. Add private credentials, deploy, press “Send test alert”, and verify the message arrives.
+- The ZIP cannot verify external feeds, live market availability, bookmaker coverage, or deployment credentials from the build environment. Those require post-deployment checks.
