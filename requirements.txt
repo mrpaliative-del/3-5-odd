@@ -1,2 +1,1 @@
-requests
-python-dotenv
+# SolveEase uses only the Python standard library.
