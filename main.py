@@ -2,7 +2,7 @@
 """
 SolveEase Booking & Arbitrage Dashboard
 Python standard library only.
-Version: 3.8.0
+Version: 3.8.1
 
 Render start command:
     python main.py
@@ -1781,6 +1781,8 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
 .hero p{max-width:680px}.feature-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
 .feature-card{display:flex;flex-direction:column;gap:8px;padding:17px;background:var(--panel);border:1px solid var(--line);border-radius:15px;min-height:180px}
 .feature-card p{margin:0;flex:1}.feature-card h2{font-size:18px}.feature-link{align-self:flex-start;background:var(--accent);color:#071b15}
+.dashboard-hero{margin-top:10px}.dashboard-tools{grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.dashboard-button{position:relative;min-height:250px;text-decoration:none;color:var(--text);transition:border-color .15s ease,transform .15s ease,box-shadow .15s ease}.dashboard-button:hover{border-color:var(--accent);transform:translateY(-3px);box-shadow:0 14px 34px rgba(0,0,0,.2)}.dashboard-button .feature-link{display:inline-flex;gap:12px;align-self:stretch;justify-content:space-between;margin-top:12px}.tool-number{position:absolute;right:15px;top:12px;color:var(--muted);font-size:12px;font-weight:800;letter-spacing:.12em}.tool-icon{display:grid;place-items:center;width:48px;height:48px;border-radius:13px;background:rgba(113,224,180,.12);border:1px solid rgba(113,224,180,.25);color:var(--accent);font-size:28px;font-weight:700}.dashboard-status{margin-top:18px}.nav{display:none}.nav.nav-visible{display:flex}
+@media(max-width:720px){.dashboard-tools{grid-template-columns:1fr}.dashboard-button{min-height:200px}.dashboard-hero h1{font-size:30px}}
 .page-section{display:none}.page-section:not(.page-hidden){display:block;animation:pageIn .18s ease-out}.page-hidden{display:none!important}.eyebrow{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);font-weight:800}.page-title{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}.page-title p{max-width:760px;margin-top:6px}.compact-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.summary-card{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:14px}.summary-card strong{display:block;font-size:18px}.summary-card span{color:var(--muted);font-size:12px}.subnav{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}.subnav a{color:var(--blue);font-size:13px;text-decoration:none;font-weight:750}.report-details{margin-top:12px;border:1px solid var(--line);border-radius:10px;padding:11px 13px;background:rgba(9,16,29,.45)}.report-details summary{cursor:pointer;font-weight:750;color:var(--blue)}@keyframes pageIn{from{opacity:.7;transform:translateY(3px)}to{opacity:1;transform:translateY(0)}}
 @media(min-width:760px){.two-col{display:grid;grid-template-columns:1fr 1fr;gap:14px}.two-col .panel{margin:0}}
 </style>
@@ -1792,38 +1794,24 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
   <h1>Booking & Arbitrage Dashboard</h1>
   <p>One workspace per task: retrieve a ticket, compare markets, review concise recommendations, and check accumulator maths.</p>
 </header>
-<nav class="nav" aria-label="Main navigation">
-  <a href="/" data-page="home">Home</a>
-  <a href="/lookup" data-page="lookup">Booking lookup</a>
+<nav class="nav" id="toolNav" aria-label="Main navigation">
+  <a href="/lookup" data-page="lookup">Booking code & filter</a>
   <a href="/converter" data-page="converter">Ticket converter</a>
-  <a href="/scanner" data-page="scanner">Market scanner</a>
-  <a href="/recommendations" data-page="recommendations">Recommendations</a>
-  <a href="/accumulator" data-page="accumulator">Accumulator</a>
-  <a href="/status" data-page="status">Feed status</a>
-  <a href="/daily" data-page="daily">Daily builder</a>
-  <a href="/optimize" data-page="optimize">Ticket optimizer</a>
-  <a href="/alerts" data-page="alerts">Telegram alerts</a>
+  <a href="/scanner" data-page="scanner">Arbitrage scanner</a>
 </nav>
 
 <section id="homePage" class="page-section">
-  <div class="hero">
-    <div class="eyebrow">SolveEase · Control centre</div>
-    <h1>Choose a tool. Get a dedicated workspace.</h1>
-    <p>Each tool opens on its own page, with a direct URL and consistent navigation. This dashboard is read-only: it does not place bets or invent booking codes.</p>
-    <div class="actions"><a class="feature-link" href="/lookup">Look up a ticket →</a><a class="feature-link" href="/recommendations">Review recommendations →</a><a class="feature-link" href="/scanner">Scan markets →</a></div>
+  <div class="hero dashboard-hero">
+    <div class="eyebrow">SOLVEEASE · CONTROL CENTRE</div>
+    <h1>One dashboard. Three tools.</h1>
+    <p>Choose what you need. Review filtered selections before using the reconstruction checklist. This service does not place bets or manufacture bookmaker booking codes.</p>
   </div>
-  <div class="feature-grid">
-    <article class="feature-card"><div class="eyebrow">01 · Tickets</div><h2>Booking-code lookup</h2><p>Retrieve supported ticket details and review selection counts and odds diagnostics.</p><a class="feature-link" href="/lookup">Open lookup →</a></article>
-    <article class="feature-card"><div class="eyebrow">02 · Tickets</div><h2>Ticket converter</h2><p>Prepare a structured checklist to recreate a retrieved ticket manually at another bookmaker.</p><a class="feature-link" href="/converter">Open converter →</a></article>
-    <article class="feature-card"><div class="eyebrow">03 · Markets</div><h2>Market scanner</h2><p>Check configured odds feeds and inspect usable market prices.</p><a class="feature-link" href="/scanner">Open scanner →</a></article>
-    <article class="feature-card"><div class="eyebrow">04 · Analysis</div><h2>Recommendations</h2><p>Compare candidate markets and review concise probability and data-quality summaries.</p><a class="feature-link" href="/recommendations">Open recommendations →</a></article>
-    <article class="feature-card"><div class="eyebrow">05 · Tickets</div><h2>Accumulator calculator</h2><p>Review combined odds and potential returns without mixing ticket maths with win predictions.</p><a class="feature-link" href="/accumulator">Open calculator →</a></article>
-    <article class="feature-card"><div class="eyebrow">06 · Daily</div><h2>Daily accumulator builder</h2><p>Filter today’s upcoming fixtures using the 70% estimate and evidence-quality gate. Never lower the threshold to fill a ticket.</p><a class="feature-link" href="/daily">Build daily scan →</a></article>
-    <article class="feature-card"><div class="eyebrow">07 · Optimization</div><h2>Booking optimizer</h2><p>Compare original selections with same-fixture alternatives; retain, replace or exclude transparently.</p><a class="feature-link" href="/optimize">Optimize ticket →</a></article>
-    <article class="feature-card"><div class="eyebrow">08 · Monitoring</div><h2>Telegram alerts</h2><p>Test configured Telegram delivery and send readable daily scan summaries.</p><a class="feature-link" href="/alerts">Configure alerts →</a></article>
-    <article class="feature-card"><div class="eyebrow">09 · Monitoring</div><h2>Feed and service status</h2><p>Inspect configured feeds, response health, freshness and the last scan report.</p><a class="feature-link" href="/status">Open status →</a></article>
+  <div class="feature-grid dashboard-tools">
+    <a class="feature-card dashboard-button" href="/lookup"><span class="tool-number">01</span><span class="tool-icon">⌕</span><h2>Booking Code & Filter</h2><p>Look up a supported ticket, analyze its selections and apply the probability filter.</p><span class="feature-link">Open tool <span aria-hidden="true">→</span></span></a>
+    <a class="feature-card dashboard-button" href="/converter"><span class="tool-number">02</span><span class="tool-icon">⇄</span><h2>Ticket Converter</h2><p>Prepare a clean reconstruction checklist using only the selections you retained.</p><span class="feature-link">Open tool <span aria-hidden="true">→</span></span></a>
+    <a class="feature-card dashboard-button" href="/scanner"><span class="tool-number">03</span><span class="tool-icon">↗</span><h2>Arbitrage Scanner</h2><p>Scan supported bookmaker feeds and inspect available price differences.</p><span class="feature-link">Open tool <span aria-hidden="true">→</span></span></a>
   </div>
-  <section class="panel"><h2>System snapshot</h2><div id="homeHealth">Checking service…</div><p class="small">A service being online does not mean every feed is configured, usable or current.</p></section>
+  <section class="panel dashboard-status"><h2>Service status</h2><div id="homeHealth">Checking service…</div><p class="small">Online status does not guarantee that odds feeds are available, fresh or accurate.</p></section>
 </section>
 
 <section class="panel page-section" id="lookupPanel">
@@ -1986,6 +1974,8 @@ function activatePage() {
   if (!page) { location.replace("/"); return; }
   const map = {home:"homePage",lookup:"lookupPanel",converter:"converterPanel",scanner:"scannerPanel",recommendations:"recommendationsPanel",accumulator:"accumulatorPanel",status:"statusPanel",daily:"dailyPanel",optimize:"optimizePanel",alerts:"alertsPanel"};
   Object.entries(map).forEach(([key,id]) => $(id).classList.toggle("page-hidden", key !== page));
+  const toolNav = $("toolNav");
+  if (toolNav) toolNav.classList.toggle("nav-visible", page !== "home");
   document.querySelectorAll(".nav a").forEach(a => {
     if (a.dataset.page === page) a.setAttribute("aria-current","page");
     else a.removeAttribute("aria-current");
@@ -1999,7 +1989,11 @@ function restoreLookup() {
   try { lastLookupData = JSON.parse(sessionStorage.getItem("solveease:lastLookup") || "null"); }
   catch (_) { lastLookupData = null; }
   if (lastLookupData && lastLookupData.ok === true) {
-    $("converterMessage").textContent = "Previous successful lookup restored for this browser tab.";
+    if (lastLookupData.filtered_ticket) {
+      $("converterMessage").textContent = "Filtered selection set restored. Only retained selections are available; the original booking code was discarded.";
+    } else {
+      $("converterMessage").textContent = "Previous successful lookup restored for this browser tab.";
+    }
     $("converterMessage").className = "success";
   }
 }
@@ -2194,7 +2188,7 @@ function renderTicketMathReview(data, parent) {
   const label = el("label", "Minimum individual implied probability to keep", panel);
   const select = document.createElement("select");
   [10, 20, 30, 40, 50, 60, 70].forEach(value => {
-    const option = document.createElement("option"); option.value = String(value); option.textContent = value + "% or higher"; if (value === 30) option.selected = true; select.appendChild(option);
+    const option = document.createElement("option"); option.value = String(value); option.textContent = value + "% or higher"; if (value === 70) option.selected = true; select.appendChild(option);
   });
   label.appendChild(select);
   const summary = el("p", "", panel, "small");
@@ -2244,16 +2238,52 @@ function renderTicketMathReview(data, parent) {
         const thresholdSelect = document.createElement("select");
         [10,20,30,40,50,60,70].forEach(value => {
           const option = document.createElement("option"); option.value = String(value); option.textContent = value + "% or higher";
-          if (value === 30) option.selected = true; thresholdSelect.appendChild(option);
+          if (value === 70) option.selected = true; thresholdSelect.appendChild(option);
         });
         thresholdLabel.appendChild(thresholdSelect);
         const summary = el("p", "", autoPanel, "small");
+        let currentKept = [];
+        const applyFilteredButton = el("button", "Use retained selections in converter", autoPanel);
+        applyFilteredButton.type = "button";
+        applyFilteredButton.disabled = true;
+        const applyFilteredNote = el("p", "Only retained, estimated selections will be carried forward. The original booking code is not retained as if it represented this changed ticket.", autoPanel, "small notice");
+        applyFilteredButton.addEventListener("click", () => {
+          if (!currentKept.length || !lastLookupData || !Array.isArray(lastLookupData.legs)) return;
+          const norm = value => String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
+          const remaining = lastLookupData.legs.slice();
+          const selectedSourceLegs = [];
+          currentKept.forEach(leg => {
+            const index = remaining.findIndex(source => norm(source.event) === norm(leg.event) && norm(source.market) === norm(leg.market) && norm(source.selection) === norm(leg.selection));
+            if (index >= 0) selectedSourceLegs.push(remaining.splice(index, 1)[0]);
+          });
+          if (!selectedSourceLegs.length) {
+            applyFilteredNote.textContent = "Could not safely match the retained analysis results back to the original ticket. Nothing was changed.";
+            applyFilteredNote.className = "small warning";
+            return;
+          }
+          lastLookupData = {...lastLookupData, legs:selectedSourceLegs, displayed_selections_count:selectedSourceLegs.length, source_selection_count:selectedSourceLegs.length, filtered_ticket:true, original_selection_count:(lastLookupData.original_selection_count || data.source_selection_count || data.legs.length), original_booking_code_discarded:true, note:"Filtered ticket derived from retained model-estimated selections only. This is not a new bookmaker booking code."};
+          try { sessionStorage.setItem("solveease:lastLookup", JSON.stringify(lastLookupData)); } catch (_) {}
+          if ($("code")) $("code").value = "";
+          if ($("manualTicketJson")) $("manualTicketJson").value = "";
+          preparedTicketText = "";
+          if ($("convertedTicket")) $("convertedTicket").textContent = "Filtered selection set ready. Prepare the reconstruction checklist to view only retained selections.";
+          if ($("converterMessage")) { $("converterMessage").textContent = "Filtered selection set applied: " + selectedSourceLegs.length + " retained. The original booking code has been discarded from the active ticket state."; $("converterMessage").className = "success"; }
+          applyFilteredNote.textContent = "Applied " + selectedSourceLegs.length + " retained selections to the converter. The original booking code is not carried forward; this is a reconstruction checklist, not a newly issued code.";
+          applyFilteredNote.className = "small success";
+          applyFilteredButton.textContent = "Filtered selections applied";
+          applyFilteredButton.disabled = true;
+        });
         function redrawAutomatic() {
           clearChildren(results);
           const all = report.ranked_legs || [];
           const estimated = all.filter(leg => leg.status === "estimated");
           const threshold = Number(thresholdSelect.value) / 100;
           const kept = estimated.filter(leg => leg.estimated_probability >= threshold);
+          currentKept = kept;
+          applyFilteredButton.disabled = kept.length === 0;
+          applyFilteredButton.textContent = kept.length ? "Use " + kept.length + " retained selections in converter" : "No qualifying selections to transfer";
+          applyFilteredNote.textContent = "Only retained, estimated selections will be carried forward. Filtered-out and unavailable selections will not be included. The original booking code will not be retained as if it represented this changed ticket.";
+          applyFilteredNote.className = "small notice";
           const filtered = estimated.filter(leg => leg.estimated_probability < threshold);
           const unavailable = all.filter(leg => leg.status !== "estimated");
           summary.textContent = "Retained " + kept.length + " · filtered below probability threshold " + filtered.length + " · unavailable " + unavailable.length + ". Threshold is a screening rule, not a guarantee.";
@@ -2324,6 +2354,7 @@ function prepareConversion() {
     "Destination bookmaker: " + destinationName,
     "Source ticket retrieved: " + (data.retrieved_at || "Time unavailable"),
     "Displayed selections: " + data.legs.length,
+    ...(data.filtered_ticket ? ["Ticket basis: FILTERED SELECTIONS ONLY", "Original booking code: DISCARDED; this filtered set has no new bookmaker-issued code"] : []),
     "",
     "STATUS: NOT A DESTINATION BOOKING CODE",
     "This checklist has not been matched against the destination's live markets.",
@@ -2689,7 +2720,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "status": "online",
                 "service": "SolveEase Booking & Arbitrage Dashboard",
-                "version": "3.8.0",
+                "version": "3.8.1",
                 "configured_feeds": configured,
                 "feed_status": feed_status,
                 "feed_freshness_threshold_seconds": STALE_AFTER_SECONDS,
@@ -2861,7 +2892,7 @@ def main():
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
-    logging.info("SolveEase Booking & Arbitrage Dashboard v3.8.0 listening on port %s", PORT)
+    logging.info("SolveEase Booking & Arbitrage Dashboard v3.8.1 listening on port %s", PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

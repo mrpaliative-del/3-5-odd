@@ -1,4 +1,4 @@
-# SolveEase Booking & Arbitrage Dashboard — v3.8.0
+# SolveEase Booking & Arbitrage Dashboard — v3.8.1
 
 A single, integrated, standard-library Python application for read-only booking analysis, ticket conversion checklists, odds scanning/arbitrage calculations, daily fixture screening, same-fixture ticket optimization, model diagnostics and optional Telegram alerts. It does **not** place bets or create valid bookmaker booking codes.
 
@@ -9,7 +9,8 @@ A single, integrated, standard-library Python application for read-only booking 
 - **Daily accumulator builder:** local date defaults to `Africa/Lagos`; filters past/started fixtures and other dates; target 20, maximum 40, one selection per fixture; if fewer qualify it reports the shortfall and never lowers the 70% gate.
 - **Probability/model tools:** existing goal-rate/Poisson analysis plus an explicit Dixon–Coles score matrix helper, Bayesian-style shrinkage helper, implied probability/overround removal, and Brier/log-loss calculator. Dixon–Coles rho and all model outputs remain uncalibrated until fitted and validated on suitable out-of-sample data.
 - **Psychological decision checks:** diagnostic flags for recency, reputation, narrative, chasing/gambler's fallacy, timestamped odds movement availability, and consensus availability. These flags do not change probability estimates and do not claim to read minds.
-- **Independent tool pages:** lookup, manual converter, market/arbitrage scanner, recommendations, accumulator maths, daily builder, ticket optimizer, Telegram alerts, and feed/service status.
+- **Simplified dashboard:** exactly three primary tools on the home screen — Booking Code & Filter, Ticket Converter, and Arbitrage Scanner. Advanced pages remain available from their relevant workspaces/routes.
+- **Filtered-ticket handoff:** the probability filter defaults to 70%; applying retained results transfers only the matched retained selections into the converter and discards the original code from active ticket state. The app does not generate a new bookmaker-issued code.
 - **Telegram:** test message and daily report endpoints with readable summaries, bounded message length, safe handling of tokens, and explicit distinction between configuration and confirmed delivery.
 - **Diagnostics:** health route, feed health/freshness reporting, standard-library tests, and explicit source/data limitations.
 
