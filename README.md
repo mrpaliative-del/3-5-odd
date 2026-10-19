@@ -1,0 +1,58 @@
+# SolveEase Booking & Arbitrage Dashboard — v3.8.8
+
+This release improves automatic football-statistics coverage by checking up to three seasons of configured Football-Data.co.uk CSV results for each supported division, instead of relying on the current season and a conditional previous-season fallback. It can improve early-season history availability; it does not guarantee coverage for every competition or every team-name variant.
+
+The model still refuses to invent probabilities when statistics cannot be matched. A displayed probability is a model estimate, not a guarantee or proof of betting value. The public Football-Data.co.uk files have usage restrictions; review the publisher's terms before commercial reuse.
+
+## Deploy on Render
+- Build command: `pip install -r requirements.txt` (or leave blank; standard-library only).
+- Start command: `python main.py`
+- The service listens on `PORT` (Render supplies this automatically; defaults to 10000 locally).
+- Keep your existing environment variables and secrets in Render; do not commit `.env`.
+
+## Validation
+Run `python -m unittest -q`. Unit tests use synthetic fixtures and do not prove live CSV availability, team matching, bookmaker-feed availability, or Telegram delivery.
+
+
+## v3.9.3 diagnostics fix
+
+- Render logs now include HTTP method, safe endpoint path, and response status; request bodies, booking codes, and query strings remain excluded.
+- Browser network errors identify whether `/api/lookup` or `/api/analyze-ticket` failed before an HTTP response arrived.
+- The filtering cutoff remains 70%; no probability or selection is fabricated.
+
+
+## v3.9.3 cross-league team-history quick fix
+- Team histories are now matched independently across supported domestic CSV divisions; the two clubs no longer have to appear in the same CSV.
+- Cross-league rates are normalized against each team's own league scoring baselines and scaled to the home team's scoring environment.
+- Staleness is checked against the older of the two teams' latest available match dates.
+- Understat xG is blended only when both teams match the same supported league.
+- Unsupported teams/competitions still return not-estimated; no probabilities are fabricated.
+- This does not add leagues absent from the configured CSV provider and is not a guarantee that all 47 legs will be covered.
+
+
+## v3.9.3 full-ticket allocation quick fix
+
+- Reviews every source ticket leg in its original order instead of displaying only qualifying selections.
+- Marks a selection KEEP only when the supported model estimate meets the 70% threshold.
+- Marks below-threshold, unmatched, unsupported, or data-limited legs REVIEW.
+- Does not fabricate a replacement. A replacement requires a separately verified candidate for the same fixture and intended market; this version reports when none is available.
+- Only KEEP selections are passed into the ticket reconstruction workflow. The original booking code is not persisted.
+- The model remains uncalibrated; estimates are not guaranteed probabilities or betting advice.
+
+
+## v3.9.3 combined allocation and matching fix
+
+- Missing model estimates stay unavailable; JavaScript no longer converts `null` to `0.0%`.
+- Team matching normalizes Unicode accents (including æ/ae), punctuation, common club prefixes/suffixes, with a small set of established alternate names.
+- Ticket selections are still processed one by one, with the 70% KEEP threshold unchanged.
+- The lookup now states plainly that its current source does not provide a complete verified alternative-market odds list. It will not pretend a replacement scan occurred or invent substitute odds/probabilities. REVIEW selections remain excluded from reconstruction.
+- Model estimates remain uncalibrated and are not guarantees. Local tests do not prove live source availability or match coverage.
+
+
+## v3.9.4 data-quality gate
+
+- Removed ambiguous substring team matching that could merge a first team with a youth/reserve side. Exact normalized names and explicit aliases are used instead.
+- A team must have at least five matched historical results and at least two results at the relevant home/away venue before a goal-rate estimate is produced. Insufficient samples stay REVIEW/unavailable rather than generating a fragile estimate.
+- Missing-team diagnostics state the supported-source limitation and minimum sample requirement. This release does not add competitions that the configured Football-Data.co.uk source does not publish.
+- Existing supported market calculations remain independent-Poisson estimates, uncalibrated and not guarantees. Unsupported handicap/period markets are not assigned invented probabilities.
+- Replacement search remains unavailable unless a verified alternative-odds feed is configured; no substitute odds are fabricated.
