@@ -2,7 +2,7 @@
 """
 SolveEase Booking & Arbitrage Dashboard
 Python standard library only.
-Version: 3.5.1
+Version: 3.5.3
 
 Render start command:
     python main.py
@@ -465,7 +465,7 @@ def prepare_feed_request(bookmaker_key, configured_url):
                 "sportId": "sr:sport:1",
                 "marketId": "1,18,10,29,11,26,36,14,60100",
                 "pageSize": "100", "pageNum": "1", "todayGames": "false",
-                "_t": str(int(time.time() * 1000)),
+                "timeline": "720", "_t": str(int(time.time() * 1000)),
             }
             url = "https://www.sportybet.com/api/ng/factsCenter/pcUpcomingEvents?" + urlencode(params)
             return url, {
@@ -490,11 +490,10 @@ def prepare_feed_request(bookmaker_key, configured_url):
                 return "https://1xbet.ng/LineFeed/BestGamesExtZip?" + urlencode(params), {"Accept": "application/json, text/plain, */*", "Referer": "https://1xbet.ng/en"}
 
     if bookmaker_key == "betway":
-        # Candidate endpoint documented for Betway's South African site. Nigeria host is
-        # deliberately retained; it may 404 if that regional site uses another backend.
-        if host == "betway.com.ng" or host.endswith(".betway.com.ng"):
-            if "/sportsapi/" not in path:
-                return "https://www.betway.com.ng/sportsapi/br/v1/BetBook/Highlights/", {"Accept": "application/json, text/plain, */*", "Referer": "https://www.betway.com.ng/"}
+        # Public evidence found for the flat-array SportsAPI is for Betway South Africa,
+        # not Betway Nigeria. Never redirect a Nigeria configuration to another region.
+        # A configured URL is fetched as supplied and must pass schema validation.
+        return configured_url, {"Accept": "application/json, text/plain, */*"}
     return configured_url, {}
 
 
@@ -867,6 +866,32 @@ def fetch_all_feeds():
     """Fetch feeds, use source-specific adapters, and retain per-source diagnostics."""
     rows, health = [], []
     for key, config in BOOKMAKERS.items():
+        # An unconfigured feed must remain untested; never silently fetch a hard-coded
+        # bookmaker endpoint merely because that adapter exists. This keeps diagnostics
+        # truthful and makes local tests deterministic when no feed URLs are configured.
+        if not config["feed_url"]:
+            health.append({
+                "bookmaker": config["name"],
+                "status": "not configured",
+                "detail": "No feed URL configured; endpoint has not been tested",
+                "http_status": None,
+                "content_type": None,
+                "response_bytes": 0,
+                "fetch_ms": 0,
+                "json_valid": False,
+                "xml_valid": False if key == "bet9ja" else None,
+                "schema_valid": False,
+                "raw_events": 0,
+                "events_loaded": 0,
+                "events_rejected": 0,
+                "rejection_reasons": {},
+                "last_successful_fetch": None,
+                "data_updated_at": None,
+                "freshness_seconds": None,
+                "stale": None,
+            })
+            continue
+
         request_url, headers = prepare_feed_request(key, config["feed_url"])
         if key == "bet9ja":
             raw_events, diag = fetch_bet9ja_xml(request_url, headers)
@@ -1695,7 +1720,7 @@ activatePage();
 # ---------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SolveEase/3.5.1"
+    server_version = "SolveEase/3.5.3"
 
     def log_message(self, fmt, *args):
         # Avoid logging query strings, POST bodies, and booking codes.
@@ -1774,7 +1799,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "status": "online",
                 "service": "SolveEase Booking & Arbitrage Dashboard",
-                "version": "3.5",
+                "version": "3.5.3",
                 "configured_feeds": configured,
                 "feed_status": feed_status,
                 "feed_freshness_threshold_seconds": STALE_AFTER_SECONDS,
@@ -1869,7 +1894,7 @@ def main():
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
-    logging.info("SolveEase Booking & Arbitrage Dashboard v3.5.1 listening on port %s", PORT)
+    logging.info("SolveEase Booking & Arbitrage Dashboard v3.5.3 listening on port %s", PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
