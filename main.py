@@ -2,7 +2,7 @@
 """
 SolveEase Booking & Arbitrage Dashboard
 Python standard library only.
-Version: 3.6.1
+Version: 3.7.0
 
 Render start command:
     python main.py
@@ -55,6 +55,8 @@ IMPORTANT:
 """
 
 import json
+import csv
+import io
 import logging
 import math
 import os
@@ -64,6 +66,7 @@ import time
 import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
@@ -77,6 +80,16 @@ BANKROLL = float(os.environ.get("BANKROLL", "100000"))
 MAX_FEED_BYTES = 3_000_000
 MAX_LOOKUP_BYTES = 2_000_000
 STALE_AFTER_SECONDS = max(30, int(os.environ.get("FEED_STALE_AFTER_SECONDS", "300")))
+FOOTBALL_STATS_ENABLED = os.environ.get("FOOTBALL_STATS_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+FOOTBALL_STATS_TIMEOUT = max(2.0, min(8.0, float(os.environ.get("FOOTBALL_STATS_TIMEOUT_SECONDS", "5"))))
+FOOTBALL_STATS_CACHE_TTL = max(300, int(os.environ.get("FOOTBALL_STATS_CACHE_TTL_SECONDS", "21600")))
+FOOTBALL_STATS_MAX_AGE_DAYS = max(30, int(os.environ.get("FOOTBALL_STATS_MAX_AGE_DAYS", "540")))
+FOOTBALL_STATS_LOCK = threading.Lock()
+FOOTBALL_CSV_CACHE = {}
+FOOTBALL_STATS_CACHE = {}
+UNDERSTAT_CACHE = {}
+UNDERSTAT_LEAGUES = {"E0":"EPL", "SP1":"La_Liga", "D1":"Bundesliga", "I1":"Serie_A", "F1":"Ligue_1"}
+FOOTBALL_DIVISIONS = {"E0":"England Premier League", "E1":"England Championship", "SC0":"Scotland Premiership", "D1":"Germany Bundesliga", "I1":"Italy Serie A", "SP1":"Spain La Liga", "F1":"France Ligue 1", "N1":"Netherlands Eredivisie", "B1":"Belgium First Division A", "P1":"Portugal Primeira Liga", "T1":"Turkey Super Lig", "G1":"Greece Super League"}
 
 SPORTYBET_SHARE_URL = "https://www.sportybet.com/api/ng/orders/share/"
 
@@ -172,7 +185,7 @@ def _selection_probability(market, selection, home_rate, away_rate):
             return 1.0 - yes, "Independent-Poisson estimate for both teams to score: no"
         return None, "Unsupported BTTS selection label"
 
-    if any(term in market_text for term in ("double chance", "1x2", "match result", "full time result", "result")):
+    if any(term in market_text for term in ("double chance", "1x2", "match result", "match winner", "full time result", "result")):
         home_win = sum(prob for h, a, prob in scores if h > a)
         draw = sum(prob for h, a, prob in scores if h == a)
         away_win = sum(prob for h, a, prob in scores if h < a)
@@ -190,8 +203,9 @@ def _selection_probability(market, selection, home_rate, away_rate):
             return away_win, "Independent-Poisson estimate for away win"
         return None, "Unsupported result selection label; use Home, Draw, Away, 1X, 12, or X2"
 
-    # Market text needs an explicit numeric goal line to avoid guessing the line.
-    match = re.search(r"(?:over|under|total(?: goals)?|goals?)\s*(\d+(?:\.\d+)?)|(?:total=)(\d+(?:\.\d+)?)", market_text)
+    # Use both market and selection text, but require an explicit numeric line.
+    combined_market_text = market_text + " " + selection_text
+    match = re.search(r"(?:over|under|total(?: goals)?|goals?)\s*(\d+(?:\.\d+)?)|(?:total=)(\d+(?:\.\d+)?)", combined_market_text)
     line = None
     if match:
         line = float(match.group(1) or match.group(2))
@@ -205,6 +219,407 @@ def _selection_probability(market, selection, home_rate, away_rate):
             return under, f"Independent-Poisson estimate for total goals under {line:g}"
         return None, "Unsupported total-goals selection label; use Over <line> or Under <line>"
     return None, "Unsupported market; supported markets are 1X2/double chance, totals with a line, and BTTS"
+
+
+def _season_codes(today=None):
+    today = today or datetime.now(timezone.utc).date()
+    start = today.year if today.month >= 7 else today.year - 1
+    return [f"{start % 100:02d}{(start + 1) % 100:02d}", f"{(start - 1) % 100:02d}{start % 100:02d}"]
+
+
+def _fetch_football_csv(season, division):
+    """Fetch a bounded public CSV with process-local caching and conservative timeouts.
+
+    Football-Data.co.uk describes its free files as for private individual use. Do not
+    repurpose this adapter for a commercial data product without checking permissions.
+    """
+    key = f"{season}:{division}"
+    now = time.time()
+    with FOOTBALL_STATS_LOCK:
+        cached = FOOTBALL_CSV_CACHE.get(key)
+        cache_limit = FOOTBALL_STATS_CACHE_TTL if cached and cached[1] is not None else min(300, FOOTBALL_STATS_CACHE_TTL)
+        if cached and now - cached[0] < cache_limit:
+            return cached[1]
+    url = f"https://www.football-data.co.uk/mmz4281/{season}/{division}.csv"
+    request = Request(url, headers={"User-Agent": "SolveEase-Football-Stats/3.7 (+match-analysis)", "Accept": "text/csv,*/*;q=0.8"})
+    data = None
+    try:
+        with urlopen(request, timeout=FOOTBALL_STATS_TIMEOUT) as response:
+            if response.status == 200:
+                raw = response.read(2_500_000)
+                if raw and len(raw) <= 2_500_000:
+                    data = raw.decode("utf-8-sig", errors="replace")
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError):
+        data = None
+    with FOOTBALL_STATS_LOCK:
+        FOOTBALL_CSV_CACHE[key] = (now, data)
+    return data
+
+
+def _csv_matches(text, division, season):
+    if not text:
+        return []
+    try:
+        sample = text[:4096]
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+    except csv.Error:
+        dialect = csv.excel
+    try:
+        rows = csv.DictReader(io.StringIO(text), dialect=dialect)
+        output = []
+        for row in rows:
+            lowered = {str(k or "").strip().lower(): v for k, v in row.items()}
+            home = str(lowered.get("hometeam") or "").strip()
+            away = str(lowered.get("awayteam") or "").strip()
+            hg = finite_number(lowered.get("fthg"), minimum=0, maximum=20)
+            ag = finite_number(lowered.get("ftag"), minimum=0, maximum=20)
+            if not home or not away or hg is None or ag is None:
+                continue
+            date_text = str(lowered.get("date") or "").strip()
+            parsed_date = None
+            for fmt in ("%d/%m/%y", "%d/%m/%Y", "%Y-%m-%d"):
+                try:
+                    parsed_date = datetime.strptime(date_text, fmt).date()
+                    if fmt == "%d/%m/%y" and parsed_date.year > datetime.now().year + 1:
+                        parsed_date = parsed_date.replace(year=parsed_date.year - 100)
+                    break
+                except ValueError:
+                    pass
+            if parsed_date is None:
+                continue
+            output.append({"date": parsed_date.isoformat(), "home": home, "away": away,
+                           "hg": int(hg), "ag": int(ag), "division": division,
+                           "league": FOOTBALL_DIVISIONS.get(division, division), "season": season})
+        return output
+    except (csv.Error, UnicodeError, TypeError):
+        return []
+
+
+def _team_key(name):
+    name = normalize_text(name)
+    for suffix in (" football club", " fc", " afc", " cf", " sc", " club"):
+        if name.endswith(suffix):
+            name = name[:-len(suffix)].strip()
+    return re.sub(r"\b(the|women|wfc)\b", " ", name).strip()
+
+
+def _split_event_teams(event):
+    text = str(event or "").strip()
+    # Prefer explicit separators, preserving team names containing hyphens.
+    match = re.match(r"^(.+?)\s+(?:vs?\.?|v\.?|versus|@)\s+(.+?)$", text, re.I)
+    if match:
+        return match.group(1).strip(" -–—"), match.group(2).strip(" -–—")
+    match = re.match(r"^(.+?)\s+[–—]\s+(.+?)$", text)
+    if match:
+        return match.group(1).strip(), match.group(2).strip()
+    return None, None
+
+
+def _find_team_name(requested, candidates):
+    target = _team_key(requested)
+    exact = { _team_key(c): c for c in candidates }
+    if target in exact:
+        return exact[target]
+    # Safe alias handling only: accept a unique prefix match, never ambiguous guesses.
+    matches = [original for key, original in exact.items() if key and target and (key in target or target in key)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _team_match_history(matches, team):
+    key = _team_key(team)
+    out = []
+    for row in matches:
+        if _team_key(row["home"]) == key:
+            out.append({"date": row["date"], "venue": "home", "gf": row["hg"], "ga": row["ag"], "opponent": row["away"]})
+        elif _team_key(row["away"]) == key:
+            out.append({"date": row["date"], "venue": "away", "gf": row["ag"], "ga": row["hg"], "opponent": row["home"]})
+    out.sort(key=lambda x: x["date"])
+    return out
+
+
+def _avg(values, default):
+    return sum(values) / len(values) if values else default
+
+
+def _summarize_team(history):
+    recent = history[-10:]
+    home = [m for m in history if m["venue"] == "home"]
+    away = [m for m in history if m["venue"] == "away"]
+    wins = sum(1 for m in recent if m["gf"] > m["ga"])
+    draws = sum(1 for m in recent if m["gf"] == m["ga"])
+    return {
+        "matches_available": len(history), "recent_matches_used": len(recent),
+        "recent_goals_for_avg": round(_avg([m["gf"] for m in recent], 1.2), 3),
+        "recent_goals_against_avg": round(_avg([m["ga"] for m in recent], 1.2), 3),
+        "recent_win_rate": round(wins / len(recent), 3) if recent else None,
+        "recent_draw_rate": round(draws / len(recent), 3) if recent else None,
+        "home_matches": len(home), "home_goals_for_avg": round(_avg([m["gf"] for m in home], _avg([m["gf"] for m in history], 1.35)), 3),
+        "home_goals_against_avg": round(_avg([m["ga"] for m in home], _avg([m["ga"] for m in history], 1.2)), 3),
+        "away_matches": len(away), "away_goals_for_avg": round(_avg([m["gf"] for m in away], _avg([m["gf"] for m in history], 1.1)), 3),
+        "away_goals_against_avg": round(_avg([m["ga"] for m in away], _avg([m["ga"] for m in history], 1.35)), 3),
+    }
+
+
+def _fetch_understat_league(league_slug, season_start):
+    """Try the public Understat JSON endpoint for xG in supported leagues only.
+
+    This endpoint is unofficial for this app and may change or reject automated access;
+    failure is non-fatal and the model falls back to historical goals.
+    """
+    key = f"{league_slug}:{season_start}"
+    now = time.time()
+    with FOOTBALL_STATS_LOCK:
+        cached = UNDERSTAT_CACHE.get(key)
+        cache_limit = FOOTBALL_STATS_CACHE_TTL if cached and cached[1] is not None else min(1800, FOOTBALL_STATS_CACHE_TTL)
+        if cached and now - cached[0] < cache_limit:
+            return cached[1]
+    url = f"https://understat.com/getLeagueData/{league_slug}/{season_start}"
+    request = Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (compatible; SolveEase/3.7; match-statistics)",
+        "X-Requested-With": "XMLHttpRequest", "Referer": "https://understat.com/",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+    })
+    parsed = None
+    try:
+        with urlopen(request, timeout=FOOTBALL_STATS_TIMEOUT) as response:
+            if response.status == 200:
+                raw = response.read(2_000_000)
+                payload = json.loads(raw.decode("utf-8", errors="replace"))
+                teams = payload.get("teams") if isinstance(payload, dict) else None
+                parsed = []
+                if isinstance(teams, dict):
+                    iterable = teams.values()
+                elif isinstance(teams, list):
+                    iterable = teams
+                else:
+                    iterable = []
+                for team in iterable:
+                    if not isinstance(team, dict):
+                        continue
+                    name = str(team.get("title") or team.get("name") or "").strip()
+                    history = team.get("history")
+                    if not name or not isinstance(history, list):
+                        continue
+                    for match in history:
+                        if not isinstance(match, dict):
+                            continue
+                        xg = finite_number(match.get("xG"), minimum=0, maximum=15)
+                        xga = finite_number(match.get("xGA"), minimum=0, maximum=15)
+                        venue = str(match.get("h_a") or "").lower()
+                        date_text = str(match.get("date") or "")[:10]
+                        if xg is None or xga is None or venue not in ("h", "a"):
+                            continue
+                        parsed.append({"team": name, "venue": "home" if venue == "h" else "away", "xg": xg, "xga": xga, "date": date_text})
+                if not parsed:
+                    parsed = None
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError, TypeError, json.JSONDecodeError):
+        parsed = None
+    with FOOTBALL_STATS_LOCK:
+        UNDERSTAT_CACHE[key] = (now, parsed)
+    return parsed
+
+
+def _xg_rates(division, home_name, away_name):
+    league_slug = UNDERSTAT_LEAGUES.get(division)
+    if not league_slug:
+        return None
+    season_start = datetime.now(timezone.utc).year if datetime.now(timezone.utc).month >= 7 else datetime.now(timezone.utc).year - 1
+    rows = _fetch_understat_league(league_slug, season_start)
+    if not rows:
+        return None
+    home_key, away_key = _team_key(home_name), _team_key(away_name)
+    home_rows = [r for r in rows if _team_key(r["team"]) == home_key and r["venue"] == "home"]
+    away_rows = [r for r in rows if _team_key(r["team"]) == away_key and r["venue"] == "away"]
+    if len(home_rows) < 3 or len(away_rows) < 3:
+        return None
+    # Team-level match xG at the correct venue, with opposing venue xGA as defensive signal.
+    home_attack = _avg([r["xg"] for r in home_rows[-10:]], 1.4)
+    away_defence = _avg([r["xga"] for r in away_rows[-10:]], 1.4)
+    away_attack = _avg([r["xg"] for r in away_rows[-10:]], 1.1)
+    home_defence = _avg([r["xga"] for r in home_rows[-10:]], 1.2)
+    home_rate = max(0.15, min(4.5, (home_attack + away_defence) / 2))
+    away_rate = max(0.15, min(4.5, (away_attack + home_defence) / 2))
+    return {"home_goal_rate": round(home_rate, 3), "away_goal_rate": round(away_rate, 3),
+            "home_xg_matches": len(home_rows), "away_xg_matches": len(away_rows),
+            "source": "Understat team match xG/xGA", "xg_available": True}
+
+
+def fetch_match_statistics(event):
+    """Automatically infer expected-goal rates from recent/home-away results.
+
+    This uses historical goals as a fallback model, not official xG. The public CSV
+    source has private-use restrictions; coverage is limited to configured divisions.
+    """
+    if not FOOTBALL_STATS_ENABLED:
+        return {"ok": False, "status": "disabled", "reason": "Automatic football statistics are disabled by configuration."}
+    home_requested, away_requested = _split_event_teams(event)
+    if not home_requested or not away_requested:
+        return {"ok": False, "status": "unmatched", "reason": "Could not reliably split this event into home and away teams.", "event": event}
+    cache_key = _team_key(home_requested) + "::" + _team_key(away_requested)
+    now = time.time()
+    with FOOTBALL_STATS_LOCK:
+        cached = FOOTBALL_STATS_CACHE.get(cache_key)
+        if cached and now - cached[0] < FOOTBALL_STATS_CACHE_TTL:
+            return dict(cached[1])
+    seasons = _season_codes()
+    rows_by_division = {}
+    # Fetch current season first; only fetch last season for divisions with no current CSV
+    # or where both clubs cannot be matched. Parallel I/O keeps the mobile workflow bounded.
+    def fetch_division(division):
+        season = seasons[0]
+        content = _fetch_football_csv(season, division)
+        parsed = _csv_matches(content, division, season)
+        return division, parsed
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(fetch_division, division) for division in FOOTBALL_DIVISIONS]
+        for future in as_completed(futures):
+            try:
+                division, parsed = future.result()
+                if parsed:
+                    rows_by_division[division] = parsed
+            except Exception:
+                continue
+    def select_league(rows_map):
+        candidates = []
+        for division, matches in rows_map.items():
+            teams = sorted({row["home"] for row in matches} | {row["away"] for row in matches})
+            hname = _find_team_name(home_requested, teams)
+            aname = _find_team_name(away_requested, teams)
+            if hname and aname and _team_key(hname) != _team_key(aname):
+                hhist = _team_match_history(matches, hname)
+                ahist = _team_match_history(matches, aname)
+                # Need evidence for both clubs; a lone historical spelling match is not enough.
+                if len(hhist) >= 2 and len(ahist) >= 2:
+                    candidates.append((len(hhist) + len(ahist), division, matches, hname, aname, hhist, ahist))
+        return max(candidates, default=None, key=lambda item: item[0])
+    chosen = select_league(rows_by_division)
+    if not chosen:
+        # Fall back to the previous season, where newly promoted / renamed teams may have data.
+        def fetch_previous(division):
+            return division, _csv_matches(_fetch_football_csv(seasons[1], division), division, seasons[1])
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(fetch_previous, division) for division in FOOTBALL_DIVISIONS]
+            for future in as_completed(futures):
+                try:
+                    division, parsed = future.result()
+                    if parsed:
+                        rows_by_division[division] = rows_by_division.get(division, []) + parsed
+                except Exception:
+                    continue
+        chosen = select_league(rows_by_division)
+    if not chosen:
+        result = {"ok": False, "status": "unmatched", "event": event,
+                  "reason": "No supported league CSV contained enough recent results for both teams. No model probability was invented.",
+                  "source": "Football-Data.co.uk public CSV archive", "checked_divisions": list(FOOTBALL_DIVISIONS),
+                  "seasons_checked": seasons}
+        with FOOTBALL_STATS_LOCK:
+            FOOTBALL_STATS_CACHE[cache_key] = (now, result)
+        return result
+    _, division, matches, home_name, away_name, home_history, away_history = chosen
+    # Enrich current-season form with last season for teams that have enough history.
+    previous_rows = [] if any(row["season"] == seasons[1] for row in matches) else _csv_matches(_fetch_football_csv(seasons[1], division), division, seasons[1])
+    if previous_rows:
+        matches = previous_rows + matches
+        home_history = _team_match_history(matches, home_name)
+        away_history = _team_match_history(matches, away_name)
+    hsum, asum = _summarize_team(home_history), _summarize_team(away_history)
+    league_rows = [row for row in matches if row["hg"] >= 0 and row["ag"] >= 0]
+    league_home = _avg([row["hg"] for row in league_rows], 1.45)
+    league_away = _avg([row["ag"] for row in league_rows], 1.15)
+    # Strength ratios are shrunk toward league averages when venue samples are small.
+    h_n, a_n = hsum["home_matches"], asum["away_matches"]
+    h_for = (hsum["home_goals_for_avg"] * min(h_n, 8) + league_home * max(0, 8-h_n)) / max(8, min(h_n, 8) + max(0, 8-h_n))
+    a_against = (asum["away_goals_against_avg"] * min(a_n, 8) + league_home * max(0, 8-a_n)) / max(8, min(a_n, 8) + max(0, 8-a_n))
+    a_for = (asum["away_goals_for_avg"] * min(a_n, 8) + league_away * max(0, 8-a_n)) / max(8, min(a_n, 8) + max(0, 8-a_n))
+    h_against = (hsum["home_goals_against_avg"] * min(h_n, 8) + league_away * max(0, 8-h_n)) / max(8, min(h_n, 8) + max(0, 8-h_n))
+    home_base = max(0.15, min(4.5, h_for * a_against / max(0.25, league_home)))
+    away_base = max(0.15, min(4.5, a_for * h_against / max(0.25, league_away)))
+    # Blend recent goals (40%) with venue-adjusted attack/defence (60%).
+    home_recent = (hsum["recent_goals_for_avg"] + asum["recent_goals_against_avg"]) / 2
+    away_recent = (asum["recent_goals_for_avg"] + hsum["recent_goals_against_avg"]) / 2
+    home_rate = max(0.15, min(4.5, 0.60 * home_base + 0.40 * home_recent))
+    away_rate = max(0.15, min(4.5, 0.60 * away_base + 0.40 * away_recent))
+    xg = _xg_rates(division, home_name, away_name)
+    if xg:
+        # Actual xG signals get 60% weight, historical-goal model 40%.
+        home_rate = max(0.15, min(4.5, 0.60 * xg["home_goal_rate"] + 0.40 * home_rate))
+        away_rate = max(0.15, min(4.5, 0.60 * xg["away_goal_rate"] + 0.40 * away_rate))
+    latest_date = datetime.fromisoformat(max((row["date"] for row in matches if row["date"]), default="2000-01-01")).date()
+    data_age_days = (datetime.now(timezone.utc).date() - latest_date).days
+    if data_age_days > FOOTBALL_STATS_MAX_AGE_DAYS:
+        result = {"ok": False, "status": "stale", "event": event,
+                  "reason": f"Latest available result is {data_age_days} days old, beyond the configured freshness limit.",
+                  "latest_match_date": latest_date.isoformat(), "source": "Football-Data.co.uk historical match results CSV"}
+        with FOOTBALL_STATS_LOCK:
+            FOOTBALL_STATS_CACHE[cache_key] = (now, result)
+        return result
+    latest = max((row["date"] for row in matches if row["date"]), default=None)
+    result = {
+        "ok": True, "status": "estimated", "event": event,
+        "home_team_matched": home_name, "away_team_matched": away_name,
+        "league": FOOTBALL_DIVISIONS.get(division, division), "division": division,
+        "seasons_used": sorted({row["season"] for row in matches}),
+        "source": ("Understat xG/xGA + Football-Data.co.uk results" if xg else "Football-Data.co.uk historical match results CSV"),
+        "source_url": f"https://www.football-data.co.uk/mmz4281/{seasons[0]}/{division}.csv",
+        "source_urls": [f"https://www.football-data.co.uk/mmz4281/{season}/{division}.csv" for season in sorted({row["season"] for row in matches})],
+        "latest_match_date": latest, "data_age_days": data_age_days,
+        "home_goal_rate": round(home_rate, 3), "away_goal_rate": round(away_rate, 3),
+        "xg_available": bool(xg), "xg_source": xg.get("source") if xg else None,
+        "xg_home_matches": xg.get("home_xg_matches") if xg else 0, "xg_away_matches": xg.get("away_xg_matches") if xg else 0,
+        "xg_note": ("xG/xGA data matched for supported league; blended with result-based form." if xg else "Official xG was unavailable for this match/league; rates are estimated from goals, venue splits and recent form."),
+        "home_stats": hsum, "away_stats": asum,
+        "league_baseline_home_goals": round(league_home, 3), "league_baseline_away_goals": round(league_away, 3),
+        "matches_in_league_sample": len(league_rows),
+        "method": "60% venue-adjusted attack/defence rates + 40% recent goals for/against; rates shrunk toward league averages for small venue samples.",
+        "warnings": ["Goal-derived expected rates are not official xG.", "This baseline is not trained or calibrated and must be backtested before relying on it.", "Team name matching can fail for reserve, women's, youth or neutral-site fixtures."],
+    }
+    with FOOTBALL_STATS_LOCK:
+        FOOTBALL_STATS_CACHE[cache_key] = (now, result)
+    return result
+
+
+def analyze_ticket_automatically(payload):
+    legs = payload.get("legs") if isinstance(payload, dict) else None
+    if not isinstance(legs, list) or not legs:
+        raise ValueError("Provide a non-empty 'legs' array")
+    if len(legs) > 50:
+        raise ValueError("Maximum 50 ticket legs per analysis")
+    results = []
+    for index, leg in enumerate(legs, 1):
+        if not isinstance(leg, dict):
+            continue
+        event = str(leg.get("event") or "").strip()
+        market = str(leg.get("market") or "").strip()
+        selection = str(leg.get("selection") or "").strip()
+        odds = finite_number(leg.get("odds"), minimum=1.01, maximum=1000)
+        if not event or not market or not selection:
+            results.append({"index": index, "event": event, "market": market, "selection": selection, "status": "unmatched", "reason": "Ticket did not provide a clear event, market and selection."})
+            continue
+        stats = fetch_match_statistics(event)
+        item = {"index": index, "event": event, "market": market, "selection": selection, "odds": odds,
+                "stats_status": stats.get("status"), "stats": stats}
+        if not stats.get("ok"):
+            item.update({"status": "not_estimated", "reason": stats.get("reason", "Statistics unavailable."), "estimated_probability": None})
+            results.append(item)
+            continue
+        probability, method = _selection_probability(market, selection, stats["home_goal_rate"], stats["away_goal_rate"])
+        implied = 1.0 / odds if odds else None
+        edge = (probability * odds - 1) * 100 if probability is not None and odds else None
+        item.update({"status": "estimated" if probability is not None else "unsupported_market", "estimated_probability": probability,
+                     "odds_implied_probability": implied, "model_fair_odds": (1 / probability if probability and probability > 0 else None),
+                     "estimated_edge_percent": edge, "method": method, "home_goal_rate": stats["home_goal_rate"], "away_goal_rate": stats["away_goal_rate"]})
+        results.append(item)
+    # Sort estimated candidates by edge first, then probability; unresolved legs follow.
+    results.sort(key=lambda x: (x.get("status") == "estimated", x.get("estimated_edge_percent") if x.get("estimated_edge_percent") is not None else -1e9,
+                                x.get("estimated_probability") if x.get("estimated_probability") is not None else -1), reverse=True)
+    return {"ok": True, "analyzed_at": now_iso(), "source": "Automatic historical team-stat lookup", "legs_received": len(legs),
+            "estimated_legs": sum(1 for x in results if x.get("status") == "estimated"),
+            "unavailable_legs": sum(1 for x in results if x.get("status") != "estimated"), "ranked_legs": results,
+            "warnings": ["Automatically estimated rates are goal-history-derived, not official xG.",
+                         "No probability is produced when team matching or market interpretation fails.",
+                         "This model is uncalibrated; estimated edge is not proof of value or profit.",
+                         "Football-Data.co.uk free CSVs are described by their publisher as for private individual use; check permissions before commercial reuse.",
+                         "No bet is placed and the original booking is never changed."]}
 
 
 def analyze_betslip(payload):
@@ -222,14 +637,32 @@ def analyze_betslip(payload):
         market = str(leg.get("market", "")).strip()
         selection = str(leg.get("selection", "")).strip()
         odds = finite_number(leg.get("odds"), minimum=1.01, maximum=1000)
-        home_rate = finite_number(leg.get("home_goal_rate"), minimum=0.05, maximum=8.0)
-        away_rate = finite_number(leg.get("away_goal_rate"), minimum=0.05, maximum=8.0)
+        home_raw, away_raw = leg.get("home_goal_rate"), leg.get("away_goal_rate")
+        home_rate = finite_number(home_raw, minimum=0.05, maximum=8.0)
+        away_rate = finite_number(away_raw, minimum=0.05, maximum=8.0)
+        auto_stats = None
+        # Explicit but invalid values are rejected; only omitted/null rates trigger lookup.
+        if home_raw not in (None, "") and home_rate is None:
+            raise ValueError(f"Leg {index}: home_goal_rate must be from 0.05 to 8.0")
+        if away_raw not in (None, "") and away_rate is None:
+            raise ValueError(f"Leg {index}: away_goal_rate must be from 0.05 to 8.0")
+        if home_rate is None or away_rate is None:
+            auto_stats = fetch_match_statistics(event)
+            if auto_stats.get("ok"):
+                home_rate = auto_stats.get("home_goal_rate")
+                away_rate = auto_stats.get("away_goal_rate")
         if not event or len(event) > 180 or not market or len(market) > 100 or not selection or len(selection) > 100:
             raise ValueError(f"Leg {index}: event, market and selection are required and must be short text")
         if odds is None:
             raise ValueError(f"Leg {index}: odds must be a finite decimal value from 1.01 to 1000")
         if home_rate is None or away_rate is None:
-            raise ValueError(f"Leg {index}: home_goal_rate and away_goal_rate must each be from 0.05 to 8.0")
+            analyzed.append({"event": event, "market": market, "selection": selection, "odds": odds,
+                             "home_goal_rate": None, "away_goal_rate": None, "estimated_probability": None,
+                             "model_fair_odds": None, "odds_implied_probability": 1.0 / odds,
+                             "estimated_edge_percent": None, "model_supported": False,
+                             "method": (auto_stats or {}).get("reason", "Automatic team statistics unavailable; no probability fabricated."),
+                             "status": "statistics unavailable"})
+            continue
         probability, method = _selection_probability(market, selection, home_rate, away_rate)
         implied = 1.0 / odds
         estimated_edge = (probability * odds - 1.0) * 100.0 if probability is not None else None
@@ -242,6 +675,7 @@ def analyze_betslip(payload):
             "estimated_edge_percent": estimated_edge,
             "model_supported": probability is not None,
             "method": method,
+            "stats_source": (auto_stats or {}).get("source") if auto_stats else "user-supplied rates",
             "status": (
                 "model suggests positive edge; verify rates, odds and settlement"
                 if probability is not None and estimated_edge is not None and estimated_edge > 0
@@ -257,13 +691,13 @@ def analyze_betslip(payload):
     return {
         "ok": True,
         "analyzed_at": now_iso(),
-        "model": "independent Poisson goal model; rates supplied by user",
+        "model": "independent Poisson baseline; automatically fetched goal-history rates when inputs are absent",
         "legs_received": len(analyzed),
         "supported_legs": len(supported),
         "unsupported_legs": len(unsupported),
         "ranked_legs": supported + unsupported,
         "warnings": [
-            "Goal rates are user-supplied expected-goal inputs, not automatically fetched team statistics.",
+            "Missing goal rates trigger automatic team-stat lookup when enabled; rates are goal-history-derived, not official xG.",
             "The independent-Poisson model is a baseline estimate, not a calibrated or verified prediction.",
             "Estimated edge is only meaningful if the goal rates are credible and odds are current.",
             "No combined accumulator win probability is calculated because legs may be correlated.",
@@ -1424,18 +1858,18 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
   <div id="scanSummary" class="grid"></div>
   <section class="panel" aria-labelledby="marketCatalogTitle">
     <h3 id="marketCatalogTitle">Markets from the latest scan</h3>
-    <p class="small">Choose an outcome from the latest usable feed markets. For model analysis, enter expected-goal rates from a credible source; these are not automatically inferred from odds.</p>
+    <p class="small">Choose an outcome from the latest usable feed markets. Analysis can automatically fetch recent results and estimate goal rates where team matching and data coverage are sufficient.</p>
     <div id="marketCatalogNote" class="small" role="status" aria-live="polite">Run a scan to load available markets.</div>
     <div id="marketCatalog"></div>
   </section>
   <section class="panel" aria-labelledby="betslipAnalysisTitle">
     <h3 id="betslipAnalysisTitle">Selected betslip market analysis</h3>
-    <p class="small">Paste your selected legs as JSON. Enter expected-goal rates from a credible source; this tool does not fetch team statistics automatically. Supported markets: 1X2, double chance, totals with a line, and both-teams-to-score.</p>
+    <p class="small">Paste selected legs as JSON. Goal-rate fields are optional: the engine tries automatic historical team-stat lookup when they are omitted. Supported markets: 1X2, double chance, totals with a line, and both-teams-to-score.</p>
     <label for="betslipJson">Selected games and markets (JSON)</label>
     <textarea id="betslipJson" rows="10" maxlength="16000" spellcheck="false">{
   "legs": [
-    {"event":"Alpha FC vs Beta FC","market":"1X2","selection":"Home","odds":2.10,"home_goal_rate":1.55,"away_goal_rate":1.05},
-    {"event":"Alpha FC vs Beta FC","market":"Total Goals 2.5","selection":"Over 2.5","odds":1.90,"home_goal_rate":1.55,"away_goal_rate":1.05}
+    {"event":"Arsenal vs Chelsea","market":"1X2","selection":"Home","odds":2.10},
+    {"event":"Arsenal vs Chelsea","market":"Total Goals 2.5","selection":"Over 2.5","odds":1.90}
   ]
 }</textarea>
     <div class="actions"><button type="button" id="analyzeBetslipBtn" onclick="analyzeBetslip()">Analyze selected markets</button><button type="button" class="secondary" onclick="clearBetslipAnalysis()">Clear analysis</button></div>
@@ -1665,6 +2099,7 @@ async function lookup() {
       if (leg.kickoff) el("p", "Kickoff/source time: " + leg.kickoff, card, "small");
     });
     el("p", data.note || "Verify details at the source bookmaker.", box, "small");
+    renderTicketMathReview(data, box);
   } catch (err) {
     $("lookupMessage").textContent = err.message;
     $("lookupMessage").className = "error";
@@ -1672,6 +2107,120 @@ async function lookup() {
     $("lookupBtn").disabled = false;
   }
 }
+
+
+function renderTicketMathReview(data, parent) {
+  const panel = el("section", "", parent, "panel");
+  el("h3", "Independent ticket review — ranked and filtered", panel);
+  el("p", "This review does not preserve the booking order. It ranks identifiable legs by raw odds-implied probability (1 ÷ decimal odds), highest first, and filters by your chosen minimum. This is bookmaker-odds arithmetic, not an independently verified forecast.", panel, "small");
+  const verified = (data.legs || []).filter(leg => leg.odds_verified === true && Number.isFinite(Number(leg.odds)) && Number(leg.odds) > 1);
+  const unknown = (data.legs || []).filter(leg => !leg.odds_verified || !Number.isFinite(Number(leg.odds)) || Number(leg.odds) <= 1);
+  const combined = verified.length === (data.legs || []).length && verified.length
+    ? verified.reduce((value, leg) => value * (1 / Number(leg.odds)), 1) : null;
+  const stats = el("div", "", panel, "grid");
+  [["Legs with usable odds", verified.length], ["Odds missing / unverified", unknown.length], ["Naive combined implied chance", combined === null ? "Not calculable" : (combined * 100).toFixed(4) + "%"]].forEach(([label, value]) => {
+    const card = el("div", "", stats, "stat"); el("span", label, card); el("strong", String(value), card);
+  });
+  if (combined !== null) el("p", "The combined figure is the product of individual implied probabilities under an independence assumption. It is not a calibrated accumulator forecast; correlated legs and bookmaker margin can make it misleading.", panel, "small notice");
+  const label = el("label", "Minimum individual implied probability to keep", panel);
+  const select = document.createElement("select");
+  [10, 20, 30, 40, 50, 60, 70].forEach(value => {
+    const option = document.createElement("option"); option.value = String(value); option.textContent = value + "% or higher"; if (value === 30) option.selected = true; select.appendChild(option);
+  });
+  label.appendChild(select);
+  const summary = el("p", "", panel, "small");
+  const list = el("div", "", panel);
+  function redraw() {
+    clearChildren(list);
+    const threshold = Number(select.value) / 100;
+    const ranked = verified.map(leg => ({...leg, implied: 1 / Number(leg.odds)})).sort((a,b) => b.implied - a.implied);
+    const kept = ranked.filter(leg => leg.implied >= threshold);
+    const filtered = ranked.filter(leg => leg.implied < threshold);
+    summary.textContent = "Kept " + kept.length + " · filtered below threshold " + filtered.length + " · unverified odds " + unknown.length + ". Filter is a screening rule, not proof a selection is good.";
+    if (!ranked.length) el("p", "No selections have verifiable decimal odds, so probability ranking is unavailable.", list, "warning");
+    kept.forEach((leg, index) => {
+      const card = el("article", "", list, "item");
+      el("h4", (index + 1) + ". " + leg.event, card);
+      el("p", (leg.market || "Market unknown") + " — " + (leg.selection || "Selection unknown"), card);
+      el("p", "Odds " + Number(leg.odds).toFixed(3) + " · raw implied probability " + (leg.implied * 100).toFixed(2) + "%", card);
+      el("p", "Screen: retained at selected threshold; outcome still uncertain.", card, "small");
+    });
+    if (filtered.length) {
+      el("h4", "Filtered out", list);
+      filtered.forEach(leg => {
+        const card = el("article", "", list, "item");
+        el("strong", leg.event, card);
+        el("p", (leg.market || "Market unknown") + " — " + (leg.selection || "Selection unknown") + " · " + (leg.implied * 100).toFixed(2) + "% implied", card);
+      });
+    }
+    unknown.forEach(leg => {
+      const card = el("article", "", list, "item");
+      el("strong", leg.event + " — not ranked", card);
+      el("p", "Odds or selected outcome could not be verified. No probability is fabricated.", card, "warning");
+    });
+  }
+  select.addEventListener("change", redraw);
+  redraw();
+  // Automatically run the historical team-stat analysis after a successful ticket lookup.
+  if (Array.isArray(data.legs) && data.legs.length) {
+    const autoPanel = el("section", "", parent, "panel");
+    el("h3", "Automatic statistical analysis", autoPanel);
+    const status = el("p", "Fetching recent results and home/away performance…", autoPanel, "small");
+    const results = el("div", "", autoPanel);
+    api("/api/analyze-ticket", "POST", {legs: data.legs.map(leg => ({event: leg.event, market: leg.market, selection: leg.selection, odds: leg.odds_verified ? leg.odds : null}))})
+      .then(report => {
+        clearChildren(results);
+        status.textContent = "Automatic analysis finished: " + report.estimated_legs + " estimated, " + report.unavailable_legs + " unavailable.";
+        const thresholdLabel = el("label", "Minimum model probability to retain", autoPanel);
+        const thresholdSelect = document.createElement("select");
+        [10,20,30,40,50,60,70].forEach(value => {
+          const option = document.createElement("option"); option.value = String(value); option.textContent = value + "% or higher";
+          if (value === 30) option.selected = true; thresholdSelect.appendChild(option);
+        });
+        thresholdLabel.appendChild(thresholdSelect);
+        const summary = el("p", "", autoPanel, "small");
+        function redrawAutomatic() {
+          clearChildren(results);
+          const all = report.ranked_legs || [];
+          const estimated = all.filter(leg => leg.status === "estimated");
+          const threshold = Number(thresholdSelect.value) / 100;
+          const kept = estimated.filter(leg => leg.estimated_probability >= threshold);
+          const filtered = estimated.filter(leg => leg.estimated_probability < threshold);
+          const unavailable = all.filter(leg => leg.status !== "estimated");
+          summary.textContent = "Retained " + kept.length + " · filtered below probability threshold " + filtered.length + " · unavailable " + unavailable.length + ". Threshold is a screening rule, not a guarantee.";
+          function renderLeg(leg, rank, target, isFiltered) {
+            const card = el("article", "", target, "item");
+            el("h4", (rank ? rank + ". " : "") + (leg.event || "Event unavailable"), card);
+            el("p", (leg.market || "Market unavailable") + " — " + (leg.selection || "Selection unavailable"), card);
+            if (leg.status === "estimated") {
+              el("p", "Estimated probability " + money(leg.estimated_probability * 100) + "% · fair odds " + money(leg.model_fair_odds, 3), card, isFiltered ? "warning" : "success");
+              if (leg.odds != null && leg.odds_implied_probability != null) el("p", "Odds-implied " + money(leg.odds_implied_probability * 100) + "% · model edge " + money(leg.estimated_edge_percent) + "%", card, "small");
+              el("p", (leg.stats.league || "League not specified") + " · latest result " + (leg.stats.latest_match_date || "unknown") + " · source " + (leg.stats.source || "unknown"), card, "small");
+              const hs = leg.stats.home_stats || {}, as = leg.stats.away_stats || {};
+              el("p", "Home team recent form: " + (hs.recent_matches_used ?? 0) + " matches · GF " + (hs.recent_goals_for_avg ?? "n/a") + " / GA " + (hs.recent_goals_against_avg ?? "n/a") + " per match · home venue sample " + (hs.home_matches ?? 0) + " · home GF/GA " + (hs.home_goals_for_avg ?? "n/a") + "/" + (hs.home_goals_against_avg ?? "n/a"), card, "small");
+              el("p", "Away team recent form: " + (as.recent_matches_used ?? 0) + " matches · GF " + (as.recent_goals_for_avg ?? "n/a") + " / GA " + (as.recent_goals_against_avg ?? "n/a") + " per match · away venue sample " + (as.away_matches ?? 0) + " · away GF/GA " + (as.away_goals_for_avg ?? "n/a") + "/" + (as.away_goals_against_avg ?? "n/a"), card, "small");
+              el("p", "Estimated home/away goal rates " + leg.home_goal_rate + " / " + leg.away_goal_rate + ". " + (leg.stats.xg_note || ""), card, "small notice");
+            } else el("p", leg.reason || (leg.stats && leg.stats.reason) || "Not enough reliable data to estimate this selection.", card, "warning");
+          }
+          kept.forEach((leg, idx) => renderLeg(leg, idx + 1, results, false));
+          if (filtered.length) {
+            el("h4", "Filtered below threshold", results);
+            filtered.forEach(leg => renderLeg(leg, null, results, true));
+          }
+          if (unavailable.length) {
+            el("h4", "Not estimated — insufficient evidence", results);
+            unavailable.forEach(leg => renderLeg(leg, null, results, true));
+          }
+          if (!all.length) el("p", "No ticket legs were available to analyze.", results, "warning");
+        }
+        thresholdSelect.addEventListener("change", redrawAutomatic);
+        redrawAutomatic();
+        (report.warnings || []).forEach(w => el("p", w, autoPanel, "small notice"));
+      })
+      .catch(err => { status.textContent = "Automatic stats unavailable: " + err.message + ". Odds-implied ranking remains available."; status.className = "warning"; });
+  }
+}
+function clearChildren(node) { node.replaceChildren(); }
 
 function prepareConversion() {
   const data = lastLookupData;
@@ -1869,37 +2418,22 @@ function renderMarketCatalog(markets, totalCount, truncated) {
   note.textContent = totalCount
     ? ("Showing " + markets.length + " of " + totalCount + " usable two-outcome markets from this scan." + (truncated ? " Catalog limited to first 250 markets." : ""))
     : "No usable markets are available from the configured feeds. A failed feed is not evidence that no opportunities exist.";
-  markets.forEach((market, index) => {
+  markets.forEach(market => {
     const card = el("div", "", target, "item");
     el("strong", market.event, card);
     el("p", market.market + " · " + market.bookmaker, card, "small");
-    const rates = el("div", "", card, "grid");
-    const homeWrap = el("label", "Home expected goals", rates);
-    const homeInput = el("input", "", homeWrap);
-    homeInput.type = "number"; homeInput.min = "0.05"; homeInput.max = "8"; homeInput.step = "0.05";
-    homeInput.placeholder = "e.g. 1.45"; homeInput.inputMode = "decimal"; homeInput.id = "homeRate_" + index;
-    const awayWrap = el("label", "Away expected goals", rates);
-    const awayInput = el("input", "", awayWrap);
-    awayInput.type = "number"; awayInput.min = "0.05"; awayInput.max = "8"; awayInput.step = "0.05";
-    awayInput.placeholder = "e.g. 1.10"; awayInput.inputMode = "decimal"; awayInput.id = "awayRate_" + index;
     market.outcomes.forEach(outcome => {
       const button = el("button", "", card);
       button.type = "button";
       button.textContent = "Add " + outcome.name + " @ " + outcome.odds;
-      button.addEventListener("click", () => addCatalogLeg(market, outcome, homeInput.value, awayInput.value));
+      button.addEventListener("click", () => addCatalogLeg(market, outcome));
     });
-    el("p", "Use expected-goal inputs from a credible source. Do not enter guesses just to obtain a score.", card, "small notice");
+    el("p", "Goal rates will be fetched automatically when supported historical results can be matched.", card, "small notice");
   });
 }
 
-function addCatalogLeg(market, outcome, homeRate, awayRate) {
+function addCatalogLeg(market, outcome) {
   const message = $("betslipAnalysisMessage");
-  const h = Number(homeRate), a = Number(awayRate);
-  if (!Number.isFinite(h) || !Number.isFinite(a) || h < 0.05 || h > 8 || a < 0.05 || a > 8) {
-    message.textContent = "Enter credible home and away expected-goal rates (0.05–8.00) before adding this selection.";
-    message.className = "warning";
-    return;
-  }
   let payload;
   try { payload = JSON.parse($("betslipJson").value || '{"legs":[]}'); }
   catch (_) { payload = {legs: []}; }
@@ -1907,9 +2441,9 @@ function addCatalogLeg(market, outcome, homeRate, awayRate) {
   if (payload.legs.length >= 50) {
     message.textContent = "Maximum 50 legs per analysis."; message.className = "warning"; return;
   }
-  payload.legs.push({event: market.event, market: market.market, selection: outcome.name, odds: outcome.odds, home_goal_rate: h, away_goal_rate: a, bookmaker: market.bookmaker, updated_at: market.updated_at || null});
+  payload.legs.push({event: market.event, market: market.market, selection: outcome.name, odds: outcome.odds, bookmaker: market.bookmaker, updated_at: market.updated_at || null});
   $("betslipJson").value = JSON.stringify(payload, null, 2);
-  message.textContent = "Added " + market.event + " — " + market.market + " — " + outcome.name + ". You can add more selections, then analyze the betslip below.";
+  message.textContent = "Added " + market.event + " — " + market.market + " — " + outcome.name + ". Goal rates will be fetched automatically where data coverage allows.";
   message.className = "success";
 }
 
@@ -1938,7 +2472,7 @@ async function analyzeBetslip() {
         el("p", "Odds-implied probability (raw): " + money(leg.odds_implied_probability * 100) + "% · estimated edge: " + money(leg.estimated_edge_percent) + "%", card, leg.estimated_edge_percent > 0 ? "success" : "small");
       } else el("p", "No probability estimate produced.", card, "warning");
       el("p", leg.method, card, "small");
-      el("p", "Expected goals entered: home " + leg.home_goal_rate + " / away " + leg.away_goal_rate, card, "small");
+      el("p", leg.home_goal_rate != null && leg.away_goal_rate != null ? ("Estimated goal rates: home " + leg.home_goal_rate + " / away " + leg.away_goal_rate) : "Goal rates unavailable; selection not assigned a model probability.", card, "small");
     });
     data.warnings.forEach(warning => el("p", warning, report, "small notice"));
     message.textContent = "Analysis complete. Supported markets are ranked by estimated edge, then probability; no bet was placed.";
@@ -2060,10 +2594,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "status": "online",
                 "service": "SolveEase Booking & Arbitrage Dashboard",
-                "version": "3.6.1",
+                "version": "3.7.0",
                 "configured_feeds": configured,
                 "feed_status": feed_status,
                 "feed_freshness_threshold_seconds": STALE_AFTER_SECONDS,
+                "football_stats_enabled": FOOTBALL_STATS_ENABLED,
+                "football_stats_providers": {"results_form": "Football-Data.co.uk CSV; configured major divisions", "xg": "Understat public JSON endpoint; selected leagues only; best-effort"},
+                "football_stats_cache_ttl_seconds": FOOTBALL_STATS_CACHE_TTL,
                 "feed_status_note": "Configured does not mean tested; HTTP success does not prove official source authenticity or accurate live odds.",
                 "ticket_lookup_adapters": {"sportybet": "available", "bet9ja": "not implemented", "betking": "not implemented"},
                 "last_scan": last_scan,
@@ -2075,7 +2612,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlsplit(self.path).path
-        if path not in ("/api/lookup", "/api/scan", "/api/analyze-betslip"):
+        if path not in ("/api/lookup", "/api/scan", "/api/analyze-betslip", "/api/analyze-ticket"):
             self.send_json(404, {"ok": False, "error": "Route not found"})
             return
         if "application/json" not in self.headers.get("Content-Type", "").lower():
@@ -2088,6 +2625,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not isinstance(body, dict):
             self.send_json(400, {"ok": False, "error": "Expected JSON object"})
+            return
+
+        if path == "/api/analyze-ticket":
+            try:
+                result = analyze_ticket_automatically(body)
+                self.send_json(200, result)
+            except ValueError as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+            except Exception:
+                logging.exception("Automatic ticket analysis failed")
+                self.send_json(500, {"ok": False, "error": "Automatic analysis failed safely; no selections were changed."})
             return
 
         if path == "/api/analyze-betslip":
@@ -2166,7 +2714,7 @@ def main():
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
-    logging.info("SolveEase Booking & Arbitrage Dashboard v3.6.1 listening on port %s", PORT)
+    logging.info("SolveEase Booking & Arbitrage Dashboard v3.7.0 listening on port %s", PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -44,6 +44,13 @@ class ScannerTests(unittest.TestCase):
         self.assertIsNone(app.finite_number(float("nan")))
         self.assertIsNone(app.finite_number(float("inf")))
 
+    def test_lookup_ui_auto_ranks_and_filters_ticket_legs(self):
+        self.assertIn("renderTicketMathReview(data, box)", app.HTML)
+        self.assertIn("raw odds-implied probability", app.HTML)
+        self.assertIn("Minimum individual implied probability to keep", app.HTML)
+        self.assertIn("Filtered out", app.HTML)
+        self.assertIn("No probability is fabricated", app.HTML)
+
     def test_all_dashboard_pages_exist_and_betslip_ui_is_present(self):
         for page_id in ("homePage", "lookupPanel", "converterPanel", "scannerPanel", "statusPanel"):
             self.assertIn(f'id="{page_id}"', app.HTML)
@@ -124,7 +131,7 @@ class ScannerTests(unittest.TestCase):
         self.assertLess(leg["estimated_probability"], 1)
         self.assertAlmostEqual(leg["odds_implied_probability"], 1 / 2.1)
         self.assertIn("edge", leg["status"])
-        self.assertIn("supplied by user", result["model"])
+        self.assertIn("automatically fetched", result["model"])
 
     def test_betslip_analysis_supports_1x2_and_btts(self):
         result = app.analyze_betslip({"legs": [
@@ -177,6 +184,52 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(result["available_markets"][0]["outcomes"][0]["odds"], 2.1)
         self.assertFalse(result["available_markets_truncated"])
 
+
+    def test_auto_stats_splits_event_and_parses_public_csv(self):
+        self.assertEqual(app._split_event_teams("Alpha FC vs Beta FC"), ("Alpha FC", "Beta FC"))
+        text = "Date,HomeTeam,AwayTeam,FTHG,FTAG,FTR\n01/09/26,Alpha FC,Beta FC,2,1,H\n08/09/26,Beta FC,Alpha FC,0,0,D\n"
+        rows = app._csv_matches(text, "E0", "2627")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["hg"], 2)
+        self.assertEqual(rows[0]["league"], "England Premier League")
+
+    def test_auto_stats_team_summary_reports_venue_form(self):
+        history = [
+            {"date": "2026-09-01", "venue": "home", "gf": 2, "ga": 1, "opponent": "B"},
+            {"date": "2026-09-08", "venue": "away", "gf": 0, "ga": 0, "opponent": "C"},
+            {"date": "2026-09-15", "venue": "home", "gf": 1, "ga": 2, "opponent": "D"},
+        ]
+        summary = app._summarize_team(history)
+        self.assertEqual(summary["matches_available"], 3)
+        self.assertEqual(summary["home_matches"], 2)
+        self.assertEqual(summary["away_matches"], 1)
+        self.assertAlmostEqual(summary["recent_goals_for_avg"], 1.0)
+
+    def test_betslip_uses_automatic_statistics_when_goal_rates_absent(self):
+        stats = {"ok": True, "status": "estimated", "home_goal_rate": 1.6, "away_goal_rate": 0.9,
+                 "source": "fixture", "xg_available": False, "latest_match_date": "2026-10-01", "league": "Test League"}
+        with patch.object(app, "fetch_match_statistics", return_value=stats):
+            result = app.analyze_betslip({"legs": [{"event": "Alpha FC vs Beta FC", "market": "1X2", "selection": "Home", "odds": 2.1}]})
+        self.assertEqual(result["supported_legs"], 1)
+        self.assertIsNotNone(result["ranked_legs"][0]["estimated_probability"])
+        self.assertEqual(result["ranked_legs"][0]["home_goal_rate"], 1.6)
+
+    def test_auto_ticket_analysis_returns_unavailable_without_fabrication(self):
+        with patch.object(app, "fetch_match_statistics", return_value={"ok": False, "status": "unmatched", "reason": "no matching teams"}):
+            result = app.analyze_ticket_automatically({"legs": [{"event": "Unknown FC vs Mystery FC", "market": "1X2", "selection": "Home", "odds": 2.2}]})
+        self.assertEqual(result["estimated_legs"], 0)
+        self.assertIsNone(result["ranked_legs"][0]["estimated_probability"])
+        self.assertEqual(result["ranked_legs"][0]["status"], "not_estimated")
+
+    def test_total_goal_probability_can_read_line_from_selection(self):
+        probability, method = app._selection_probability("Total Goals", "Over 2.5", 1.5, 1.0)
+        self.assertIsNotNone(probability)
+        self.assertIn("over 2.5", method)
+
+    def test_auto_stats_ui_is_triggered_after_ticket_lookup(self):
+        self.assertIn('api("/api/analyze-ticket", "POST"', app.HTML)
+        self.assertIn("Automatic statistical analysis", app.HTML)
+        self.assertIn("Fetching recent results and home/away performance", app.HTML)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
