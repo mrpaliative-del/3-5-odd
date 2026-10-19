@@ -1,1757 +1,1745 @@
 #!/usr/bin/env python3
 """
-SolveEase Surebet Intelligence
-Version 7.0.0
+SolveEase Booking & Arbitrage Dashboard
+Python standard library only.
+Version: 3.4.0
 
-Read-only football market research:
-- Server-rendered multi-page navigation
-- SQLite scan history and odds snapshots
-- Safe database-path fallback
-- Background scheduler with non-overlapping scans
-- Configured HTTPS market feeds only
-- Conservative two-outcome arbitrage candidate detection
-- Best-effort SportyBet share-code lookup (unverified endpoint)
-- Bounded HTTP requests and basic per-IP rate limiting
-- Responsive mobile UI and installable PWA shell
+Render start command:
+    python main.py
 
-No betting, bookmaker login, staking, or guaranteed-profit claims.
+Features:
+- Responsive dashboard for mobile and desktop
+- Read-only SportyBet booking-code lookup
+- Automatic source identification only after successful supported lookup
+- Source-vs-calculated odds diagnostics
+- Ticket reconstruction for manual recreation at SportyBet, Bet9ja, or BetKing
+- Copyable ticket summary; never fabricates destination booking codes
+- Configurable JSON odds feeds for SportyBet, Bet9ja, 1xBet, and Betway
+- Two-outcome arbitrage detection across matching event/market/outcome labels
+- Feed-supplied probability filter (default 60%)
+- Alternative market prioritization (Over/Under, Double Chance, Corners)
+- Source health and last-scan reporting
+- Privacy-conscious logging (no booking codes or POST bodies logged)
+
+Environment variables:
+    PORT=10000
+    REQUEST_TIMEOUT_SECONDS=12
+    MIN_PROBABILITY=0.60
+    BANKROLL=100000
+    SPORTYBET_ODDS_FEED_URL=https://your-authorized-feed.example/feed.json
+    BET9JA_ODDS_FEED_URL=...
+    ONEXBET_ODDS_FEED_URL=...
+    BETWAY_ODDS_FEED_URL=...
+
+Feed schema:
+{
+  "events": [{
+    "sport": "football",
+    "event": "Home Team vs Away Team",
+    "market": "Total Goals 2.5",
+    "updated_at": "2026-10-18T12:00:00Z",
+    "outcomes": [
+      {"name": "Over 2.5", "odds": 2.10, "estimated_probability": 0.62},
+      {"name": "Under 2.5", "odds": 1.90, "estimated_probability": 0.38}
+    ]
+  }]
+}
+
+IMPORTANT:
+- Only use feeds you control or are authorized to access.
+- The SportyBet share endpoint is unofficial and may change.
+- No bets are placed, and no bookmaker login credentials are requested.
+- This app does not generate valid destination booking codes.
+- Feed-provided probability estimates are not independently validated.
+- An empty scan caused by unavailable feeds is not proof that no arbitrage exists.
 """
 
+import json
+import logging
+import math
 import os
 import re
-import json
-import time
-import html
-import sqlite3
-import logging
 import threading
-import ipaddress
-import socket
+import time
+import unicodedata
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from urllib.parse import urlparse, parse_qs
-from urllib.request import Request, urlopen
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from collections import defaultdict
-from itertools import groupby
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode, urlsplit
+from urllib.request import Request, urlopen
 
-
-# ------------------------------------------------------------
-# Configuration
-# ------------------------------------------------------------
-
-APP_NAME = "SolveEase Surebet Intelligence"
-VERSION = "7.0.0"
-
-HOST = os.environ.get("HOST", "0.0.0.0")
+HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "10000"))
+TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "12"))
+MIN_PROBABILITY = float(os.environ.get("MIN_PROBABILITY", "0.60"))
+BANKROLL = float(os.environ.get("BANKROLL", "100000"))
+MAX_FEED_BYTES = 3_000_000
+MAX_LOOKUP_BYTES = 2_000_000
+STALE_AFTER_SECONDS = max(30, int(os.environ.get("FEED_STALE_AFTER_SECONDS", "300")))
 
-REQUEST_TIMEOUT_SECONDS = max(
-    2, min(20, int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "8")))
-)
-MAX_RESPONSE_BYTES = max(
-    100_000,
-    min(8_000_000, int(os.environ.get("MAX_RESPONSE_BYTES", "4000000")))
-)
-MAX_REQUEST_BYTES = 256_000
-MAX_FEEDS = max(0, min(10, int(os.environ.get("MAX_FEEDS", "10"))))
-SCAN_INTERVAL_SECONDS = max(
-    60, min(86_400, int(os.environ.get("SCAN_INTERVAL_SECONDS", "900")))
-)
-QUOTE_RETENTION_DAYS = max(
-    1, min(365, int(os.environ.get("QUOTE_RETENTION_DAYS", "90")))
-)
-ENABLE_SPORTYBET_LOOKUP = (
-    os.environ.get("ENABLE_SPORTYBET_LOOKUP", "true").lower()
-    in ("1", "true", "yes", "on")
-)
+SPORTYBET_SHARE_URL = "https://www.sportybet.com/api/ng/orders/share/"
 
-MARKET_FEED_URLS = [
-    value.strip()
-    for value in os.environ.get("MARKET_FEED_URLS", "").split(";")
-    if value.strip()
-][:MAX_FEEDS]
+BOOKMAKERS = {
+    "sportybet": {
+        "name": "SportyBet",
+        "feed_url": os.environ.get("SPORTYBET_ODDS_FEED_URL", "").strip(),
+    },
+    "bet9ja": {
+        "name": "Bet9ja",
+        "feed_url": os.environ.get("BET9JA_ODDS_FEED_URL", "").strip(),
+    },
+    "1xbet": {
+        "name": "1xBet",
+        "feed_url": os.environ.get("ONEXBET_ODDS_FEED_URL", "").strip(),
+    },
+    "betway": {
+        "name": "Betway",
+        "feed_url": os.environ.get("BETWAY_ODDS_FEED_URL", "").strip(),
+    },
+}
 
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+DESTINATIONS = {
+    "sportybet": "SportyBet",
+    "bet9ja": "Bet9ja",
+    "betking": "BetKing",
+}
 
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger("solveease")
 
-STATE_LOCK = threading.RLock()
-SCAN_LOCK = threading.Lock()
-RATE_LOCK = threading.Lock()
-
-STATE = {
-    "status": "starting",
-    "version": VERSION,
-    "started_at": None,
-    "last_scan_started_at": None,
-    "last_scan_finished_at": None,
-    "last_scan_status": "not_run",
-    "last_lookup_status": "not_run",
-    "last_scan_summary": {},
-    "configured_market_feed_count": len(MARKET_FEED_URLS),
-    "note": "Service health does not prove live odds-feed availability.",
-}
-
-# Basic in-memory rate limiter. For a multi-instance deployment, use a
-# shared rate limiter at the edge; this one is intentionally lightweight.
-RATE_LIMITS = {
-    "GET": (120, 60),
-    "POST": (20, 60),
-}
-REQUEST_TIMES = defaultdict(list)
+STARTED_AT = time.time()
+STATE_LOCK = threading.Lock()
+LAST_SCAN = None
+LAST_LOOKUP = None
+LAST_FEED_STATUS = None
 
 
-# ------------------------------------------------------------
-# General helpers
-# ------------------------------------------------------------
-
-def utc_now():
+def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def clean_string(value, limit=250):
-    if value is None:
-        return ""
-    text = str(value).strip()
-    text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
-    return text[:limit]
-
-
-def safe_float(value, default=None):
+def finite_number(value, minimum=None, maximum=None):
     try:
-        number = float(value)
-        if number != number or number in (float("inf"), float("-inf")):
-            return default
+        if isinstance(value, bool) or value is None:
+            return None
+        number = float(str(value).replace(",", "").strip())
+        if not math.isfinite(number):
+            return None
+        if minimum is not None and number < minimum:
+            return None
+        if maximum is not None and number > maximum:
+            return None
         return number
     except (TypeError, ValueError, OverflowError):
-        return default
-
-
-def valid_odds(value):
-    number = safe_float(value)
-    return number is not None and 1.01 <= number <= 1000.0
-
-
-def implied_probability(decimal_odds):
-    if not valid_odds(decimal_odds):
         return None
-    return 1.0 / float(decimal_odds)
 
 
-def normalise_text(value):
-    return re.sub(r"\s+", " ", clean_string(value, 500).lower()).strip()
+def scalar(value):
+    if isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    return None
 
 
-def escape(value):
-    return html.escape(str(value if value is not None else ""), quote=True)
+def first_value(obj, keys, default=None):
+    if not isinstance(obj, dict):
+        return default
+    for key in keys:
+        value = obj.get(key)
+        if isinstance(value, (str, int, float, bool)) and value != "":
+            return value
+    return default
 
 
-def json_bytes(data):
-    return json.dumps(
-        data, ensure_ascii=False, separators=(",", ":"), default=str
-    ).encode("utf-8")
+def normalize_text(value):
+    value = unicodedata.normalize("NFKD", str(value or ""))
+    value = "".join(c for c in value if not unicodedata.combining(c))
+    value = value.lower().replace("&", " and ")
+    value = re.sub(r"[^a-z0-9.+-]+", " ", value)
+    return " ".join(value.split())
 
 
-def host_of(url):
+def safe_fetch_json(url, label, extra_headers=None):
+    """Fetch an HTTPS feed and return JSON plus safe diagnostics."""
+    started = time.monotonic()
+    diag = {
+        "http_status": None, "content_type": None, "response_bytes": 0,
+        "fetch_ms": 0, "json_valid": False, "schema_valid": False,
+        "raw_events": 0, "events_loaded": 0, "events_rejected": 0,
+        "rejection_reasons": {}, "last_successful_fetch": None,
+        "data_updated_at": None, "freshness_seconds": None,
+        "stale": None, "detail": "", "status": "not configured",
+    }
+    if not url:
+        diag["detail"] = "No feed URL configured; endpoint has not been tested"
+        return None, diag
+
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        diag.update(status="invalid configuration", detail="Feed URL must be a valid HTTPS URL")
+        return None, diag
+
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    request = Request(url, headers=headers, method="GET")
     try:
-        return (urlparse(url).hostname or "")[:200]
-    except Exception:
-        return ""
+        with urlopen(request, timeout=TIMEOUT) as response:
+            diag["http_status"] = int(response.status)
+            diag["content_type"] = response.headers.get("Content-Type", "")[:160]
+            body = response.read(MAX_FEED_BYTES + 1)
+            diag["response_bytes"] = len(body)
+            if len(body) > MAX_FEED_BYTES:
+                diag.update(status="response too large", detail=f"Response exceeded {MAX_FEED_BYTES} byte limit")
+                return None, diag
+            if not 200 <= response.status < 300:
+                diag.update(status="http error", detail=f"HTTP {response.status}")
+                return None, diag
+    except HTTPError as exc:
+        diag["http_status"] = int(exc.code)
+        diag["content_type"] = exc.headers.get("Content-Type", "")[:160] if exc.headers else ""
+        diag.update(status="http error", detail=f"HTTP {exc.code}")
+        logging.warning("%s feed returned HTTP %s", label, exc.code)
+        return None, diag
+    except (URLError, TimeoutError, OSError) as exc:
+        diag.update(status="fetch failed", detail=f"Network request failed ({type(exc).__name__})")
+        logging.warning("%s feed request failed: %s", label, type(exc).__name__)
+        return None, diag
+    finally:
+        diag["fetch_ms"] = round((time.monotonic() - started) * 1000)
 
-
-def public_https_url(url):
-    """
-    Conservative URL validation for administrator-configured feeds.
-
-    It rejects non-HTTPS URLs, credentials, localhost and IP literals that
-    are not public. For production with high threat exposure, additionally
-    restrict feed hostnames to an explicit allowlist and enforce outbound
-    network controls to mitigate DNS rebinding.
-    """
     try:
-        parsed = urlparse(url)
-        if parsed.scheme.lower() != "https":
-            return False
-        if not parsed.hostname or parsed.username or parsed.password:
-            return False
-        host = parsed.hostname.lower().rstrip(".")
-        if host in ("localhost", "localhost.localdomain"):
-            return False
-        if host.endswith((".local", ".internal", ".localhost")):
-            return False
-
-        try:
-            ip = ipaddress.ip_address(host.strip("[]"))
-            if not ip.is_global:
-                return False
-        except ValueError:
-            # Resolve names and reject private/local destinations.
-            try:
-                addresses = socket.getaddrinfo(
-                    host, parsed.port or 443, type=socket.SOCK_STREAM
-                )
-                if not addresses:
-                    return False
-                for address in addresses:
-                    resolved = ipaddress.ip_address(address[4][0])
-                    if not resolved.is_global:
-                        return False
-            except OSError:
-                return False
-
-        return True
-    except Exception:
-        return False
+        payload = json.loads(body.decode("utf-8-sig"))
+        diag["json_valid"] = True
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        diag.update(status="invalid response", detail="Response is not valid UTF-8 JSON; endpoint may return HTML or an anti-bot page")
+        return None, diag
+    if not isinstance(payload, dict):
+        diag.update(status="invalid response", detail="JSON root must be an object")
+        return None, diag
+    diag["last_successful_fetch"] = now_iso()
+    diag["status"] = "json received"
+    diag["detail"] = "Valid JSON received; feed schema not yet confirmed"
+    return payload, diag
 
 
-def fetch_json(url):
-    if not public_https_url(url):
-        raise ValueError("Feed URL failed HTTPS/public-host validation.")
+def parse_timestamp(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return None
 
+
+# ---------------------------------------------------------------------
+# SportyBet booking-code lookup
+# ---------------------------------------------------------------------
+
+def lookup_sportybet(code):
+    url = SPORTYBET_SHARE_URL + quote(code, safe="")
     request = Request(
         url,
         headers={
-            "User-Agent": "SolveEase-Surebet-Intelligence/7.0",
-            "Accept": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 15) "
+                "AppleWebKit/537.36 Chrome/131.0 Mobile Safari/537.36"
+            ),
+            "Current-Country": "NG",
+            "Referer": "https://www.sportybet.com/ng/",
         },
         method="GET",
     )
 
-    with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-        content_type = response.headers.get("Content-Type", "").lower()
-        body = response.read(MAX_RESPONSE_BYTES + 1)
-
-    if len(body) > MAX_RESPONSE_BYTES:
-        raise ValueError("Feed response exceeded configured size limit.")
-
-    # Some providers incorrectly omit the JSON content type; JSON parsing
-    # remains the final check.
     try:
-        return json.loads(body.decode("utf-8-sig"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("Feed did not return valid JSON.") from exc
+        with urlopen(request, timeout=TIMEOUT) as response:
+            if response.status != 200:
+                return {"ok": False, "error": "SportyBet lookup failed"}
+            raw_body = response.read(MAX_LOOKUP_BYTES + 1)
+            if len(raw_body) > MAX_LOOKUP_BYTES:
+                return {"ok": False, "error": "SportyBet response exceeded size limit"}
+            payload = json.loads(raw_body.decode("utf-8", errors="replace"))
+    except HTTPError as exc:
+        logging.warning("SportyBet lookup HTTP %s", exc.code)
+        return {"ok": False, "error": f"SportyBet returned HTTP {exc.code}"}
+    except (URLError, TimeoutError, OSError):
+        logging.warning("SportyBet lookup network failure")
+        return {"ok": False, "error": "Could not reach SportyBet"}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return {"ok": False, "error": "SportyBet returned invalid JSON"}
 
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "Unexpected SportyBet response"}
 
-# ------------------------------------------------------------
-# Database selection and schema
-# ------------------------------------------------------------
+    biz_code = payload.get("bizCode")
+    if biz_code is not None and str(biz_code) != "10000":
+        return {
+            "ok": False,
+            "error": str(first_value(
+                payload, ("message", "msg", "errorMsg"),
+                "SportyBet did not accept this code",
+            )),
+        }
 
-def resolve_database_path():
-    configured = os.environ.get(
-        "DATABASE_PATH", "/var/data/solveease.db"
-    ).strip() or "/var/data/solveease.db"
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        data = {}
+    ticket = data.get("ticket")
+    if not isinstance(ticket, dict):
+        ticket = {}
+    raw_legs = data.get("outcomes")
+    if not isinstance(raw_legs, list):
+        raw_legs = []
 
-    candidates = [configured]
-
-    # A writable temporary fallback prevents a missing Render disk from
-    # making the whole service fail to start. It is not persistent.
-    fallback = "/tmp/solveease.db"
-    if os.path.abspath(configured) != os.path.abspath(fallback):
-        candidates.append(fallback)
-
-    for candidate in candidates:
-        try:
-            parent = os.path.dirname(os.path.abspath(candidate))
-            os.makedirs(parent, exist_ok=True)
-            probe = os.path.join(parent, ".solveease-write-test")
-            with open(probe, "w", encoding="utf-8") as handle:
-                handle.write("ok")
-            os.remove(probe)
-
-            if candidate == configured:
-                log.info("Database path selected: %s", candidate)
-            else:
-                log.error(
-                    "Preferred database path is unavailable: %s. "
-                    "Using temporary storage at %s; history may be lost "
-                    "when the instance restarts.",
-                    configured, candidate,
-                )
-            return candidate
-        except OSError as exc:
-            log.error("Database path not writable (%s): %s", candidate, exc)
-
-    # Last-resort in-memory SQLite lets the web service start, but data
-    # lasts only for the lifetime of the process.
-    log.critical(
-        "No writable database path found; using in-memory SQLite. "
-        "All stored history will be lost on restart."
-    )
-    return ":memory:"
-
-
-DATABASE_PATH = resolve_database_path()
-DB_LOCK = threading.RLock()
-_MEMORY_CONNECTION = None
-
-
-def db_connect():
-    global _MEMORY_CONNECTION
-
-    if DATABASE_PATH == ":memory:":
-        if _MEMORY_CONNECTION is None:
-            _MEMORY_CONNECTION = sqlite3.connect(
-                ":memory:", timeout=10, check_same_thread=False
-            )
-            _MEMORY_CONNECTION.row_factory = sqlite3.Row
-        return _MEMORY_CONNECTION
-
-    connection = sqlite3.connect(
-        DATABASE_PATH, timeout=10, check_same_thread=False
-    )
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout=10000")
-    connection.execute("PRAGMA journal_mode=WAL")
-    return connection
-
-
-def init_db():
-    with DB_LOCK:
-        connection = db_connect()
-        try:
-            connection.executescript("""
-                CREATE TABLE IF NOT EXISTS scan_runs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    started_at TEXT NOT NULL,
-                    finished_at TEXT,
-                    status TEXT NOT NULL,
-                    feed_count INTEGER NOT NULL DEFAULT 0,
-                    feeds_reached INTEGER NOT NULL DEFAULT 0,
-                    quote_count INTEGER NOT NULL DEFAULT 0,
-                    candidate_count INTEGER NOT NULL DEFAULT 0,
-                    summary_json TEXT NOT NULL DEFAULT '{}'
-                );
-
-                CREATE TABLE IF NOT EXISTS market_quotes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event TEXT NOT NULL,
-                    event_id TEXT NOT NULL DEFAULT '',
-                    sport TEXT NOT NULL DEFAULT 'Football',
-                    market TEXT NOT NULL,
-                    selection TEXT NOT NULL,
-                    odds REAL NOT NULL,
-                    bookmaker TEXT NOT NULL DEFAULT '',
-                    source_host TEXT NOT NULL DEFAULT '',
-                    source_updated_at TEXT NOT NULL DEFAULT '',
-                    captured_at TEXT NOT NULL,
-                    exhaustive_two_outcome INTEGER NOT NULL DEFAULT 0
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_quotes_event
-                    ON market_quotes(event_id, event, market);
-
-                CREATE INDEX IF NOT EXISTS idx_quotes_captured
-                    ON market_quotes(captured_at);
-
-                CREATE TABLE IF NOT EXISTS lookup_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    created_at TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    outcome_count INTEGER NOT NULL DEFAULT 0,
-                    note TEXT NOT NULL DEFAULT ''
-                );
-            """)
-            connection.commit()
-        finally:
-            if DATABASE_PATH != ":memory:":
-                connection.close()
-
-
-def db_execute(sql, params=()):
-    with DB_LOCK:
-        connection = db_connect()
-        try:
-            cursor = connection.execute(sql, params)
-            connection.commit()
-            return cursor.lastrowid, cursor.rowcount
-        finally:
-            if DATABASE_PATH != ":memory:":
-                connection.close()
-
-
-def db_query(sql, params=()):
-    with DB_LOCK:
-        connection = db_connect()
-        try:
-            rows = connection.execute(sql, params).fetchall()
-            return [dict(row) for row in rows]
-        finally:
-            if DATABASE_PATH != ":memory:":
-                connection.close()
-
-
-def store_scan(started_at, finished_at, status, feed_count,
-               feeds_reached, quote_count, candidate_count, summary):
-    db_execute(
-        """
-        INSERT INTO scan_runs
-        (started_at, finished_at, status, feed_count, feeds_reached,
-         quote_count, candidate_count, summary_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            started_at, finished_at, status, feed_count, feeds_reached,
-            quote_count, candidate_count,
-            json.dumps(summary, ensure_ascii=False, default=str),
-        ),
-    )
-
-
-def store_quotes(quotes):
-    if not quotes:
-        return 0
-
-    captured_at = utc_now()
-    inserted = 0
-
-    with DB_LOCK:
-        connection = db_connect()
-        try:
-            for quote in quotes:
-                connection.execute(
-                    """
-                    INSERT INTO market_quotes
-                    (event, event_id, sport, market, selection, odds,
-                     bookmaker, source_host, source_updated_at,
-                     captured_at, exhaustive_two_outcome)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        quote["event"],
-                        quote.get("event_id", ""),
-                        quote.get("sport", "Football"),
-                        quote["market"],
-                        quote["selection"],
-                        quote["odds"],
-                        quote.get("bookmaker", ""),
-                        quote.get("source_host", ""),
-                        quote.get("updated_at", ""),
-                        captured_at,
-                        1 if quote.get("exhaustive_two_outcome") else 0,
-                    ),
-                )
-                inserted += 1
-
-            cutoff = datetime.fromtimestamp(
-                time.time() - QUOTE_RETENTION_DAYS * 86400,
-                timezone.utc,
-            ).isoformat()
-
-            connection.execute(
-                "DELETE FROM market_quotes WHERE captured_at < ?", (cutoff,)
-            )
-            connection.commit()
-        finally:
-            if DATABASE_PATH != ":memory:":
-                connection.close()
-
-    return inserted
-
-
-# ------------------------------------------------------------
-# Market feed parsing
-# ------------------------------------------------------------
-
-def first_value(mapping, keys, default=None):
-    if not isinstance(mapping, dict):
-        return default
-    for key in keys:
-        if key in mapping and mapping[key] not in (None, ""):
-            return mapping[key]
-    return default
-
-
-def extract_feed_quotes(payload, source_host):
-    """
-    Supports simple JSON feeds with a markets, quotes, or data list.
-    A feed must explicitly mark a market as exhaustive_two_outcome=true
-    before its two outcomes are eligible for arbitrage-candidate checks.
-    """
-    if isinstance(payload, list):
-        records = payload
-    elif isinstance(payload, dict):
-        records = first_value(payload, ["markets", "quotes", "data"], [])
-        if isinstance(records, dict):
-            records = first_value(records, ["markets", "quotes", "data"], [])
-    else:
-        records = []
-
-    if not isinstance(records, list):
-        return []
-
-    output = []
-
-    for item in records[:100_000]:
+    legs = []
+    for index, item in enumerate(raw_legs):
         if not isinstance(item, dict):
             continue
 
-        event = clean_string(first_value(
-            item, ["event", "fixture", "match", "event_name", "name"], ""
-        ), 250)
-        event_id = clean_string(first_value(
-            item, ["event_id", "fixture_id", "id"], ""
-        ), 150)
-        sport = clean_string(first_value(
-            item, ["sport", "sport_name"], "Football"
-        ), 60)
-        market = clean_string(first_value(
-            item, ["market", "market_name", "market_type"], ""
-        ), 150)
-        bookmaker = clean_string(first_value(
-            item, ["bookmaker", "bookmaker_name", "provider"], ""
-        ), 120)
-        updated_at = clean_string(first_value(
-            item, ["updated_at", "last_update", "timestamp"], ""
-        ), 80)
-        exhaustive = item.get("exhaustive_two_outcome") is True
-
-        outcomes = first_value(item, ["outcomes", "selections"], None)
-
-        if isinstance(outcomes, list):
-            for outcome in outcomes[:100]:
-                if not isinstance(outcome, dict):
-                    continue
-                selection = clean_string(first_value(
-                    outcome, ["selection", "name", "label", "outcome"], ""
-                ), 150)
-                odds = first_value(
-                    outcome, ["odds", "price", "decimal_odds"], None
-                )
-                if event and market and selection and valid_odds(odds):
-                    output.append({
-                        "event": event,
-                        "event_id": event_id,
-                        "sport": sport or "Football",
-                        "market": market,
-                        "selection": selection,
-                        "odds": float(odds),
-                        "bookmaker": bookmaker,
-                        "source_host": source_host,
-                        "updated_at": updated_at,
-                        "exhaustive_two_outcome": exhaustive,
-                    })
-            continue
-
-        # Flat-quote format.
-        selection = clean_string(first_value(
-            item, ["selection", "outcome", "runner"], ""
-        ), 150)
-        odds = first_value(item, ["odds", "price", "decimal_odds"], None)
-
-        if event and market and selection and valid_odds(odds):
-            output.append({
-                "event": event,
-                "event_id": event_id,
-                "sport": sport or "Football",
-                "market": market,
-                "selection": selection,
-                "odds": float(odds),
-                "bookmaker": bookmaker,
-                "source_host": source_host,
-                "updated_at": updated_at,
-                "exhaustive_two_outcome": exhaustive,
-            })
-
-    return output
-
-
-def fetch_configured_markets():
-    all_quotes = []
-    health = []
-    reached = 0
-
-    for url in MARKET_FEED_URLS:
-        host = host_of(url)
-        record = {
-            "host": host or "unknown",
-            "status": "not_reached",
-            "quotes": 0,
-            "message": "",
-        }
-
-        try:
-            payload = fetch_json(url)
-            quotes = extract_feed_quotes(payload, host)
-            all_quotes.extend(quotes)
-            reached += 1
-            record["status"] = "reached"
-            record["quotes"] = len(quotes)
-            record["message"] = (
-                "JSON parsed; quote usability depends on provider schema."
-            )
-        except Exception as exc:
-            record["status"] = "error"
-            # Do not log or return the complete URL; it may contain tokens.
-            record["message"] = clean_string(str(exc), 220)
-            log.warning("Market feed %s failed: %s", host, record["message"])
-
-        health.append(record)
-
-    return all_quotes, health, reached
-
-
-# ------------------------------------------------------------
-# Conservative arbitrage candidate scan
-# ------------------------------------------------------------
-
-def scan_arbitrage(quotes):
-    """
-    Only checks explicit exhaustive two-outcome markets.
-
-    It does not assume that Home/Draw/Away markets are exhaustive two-way
-    markets. It also requires named, different bookmakers and two distinct
-    selections. Candidate output is a research lead, not a bet instruction.
-    """
-    groups = defaultdict(list)
-
-    for quote in quotes:
-        if not quote.get("exhaustive_two_outcome"):
-            continue
-
-        event_key = quote.get("event_id") or normalise_text(quote["event"])
-        key = (
-            event_key,
-            normalise_text(quote["event"]),
-            normalise_text(quote["market"]),
+        event = first_value(
+            item,
+            ("eventName", "event_name", "matchName", "match", "fixtureName"),
+            None,
         )
-        groups[key].append(quote)
+        if not event:
+            home = first_value(item, ("homeTeamName",), "")
+            away = first_value(item, ("awayTeamName",), "")
+            event = f"{home} vs {away}" if home and away else "Event unavailable"
 
-    candidates = []
+        candidates = []
+        selected_candidates = []
+        markets = item.get("markets", [])
+        if isinstance(markets, list):
+            for market in markets:
+                if not isinstance(market, dict):
+                    continue
+                outcomes = market.get("outcomes", [])
+                if not isinstance(outcomes, list):
+                    continue
+                for outcome in outcomes:
+                    if not isinstance(outcome, dict):
+                        continue
+                    odds = finite_number(outcome.get("odds"), minimum=1.000001)
+                    if odds is None:
+                        continue
+                    candidate = (market, outcome, odds)
+                    candidates.append(candidate)
+                    marker = first_value(
+                        outcome, ("isSelected", "selected", "chosen", "betSelected"), None
+                    )
+                    if marker is True or marker == 1 or str(marker).lower() == "true":
+                        selected_candidates.append(candidate)
 
-    for key, group in groups.items():
-        selection_quotes = defaultdict(list)
-        for quote in group:
-            selection_quotes[normalise_text(quote["selection"])].append(quote)
+        chosen = None
+        if len(selected_candidates) == 1:
+            chosen = selected_candidates[0]
+        elif not selected_candidates and len(candidates) == 1:
+            chosen = candidates[0]
 
-        if len(selection_quotes) != 2:
-            continue
+        if chosen:
+            market, outcome, odds = chosen
+            market_name = first_value(
+                market, ("desc", "marketName", "marketDesc", "name"),
+                "Market unavailable",
+            )
+            selection_name = first_value(
+                outcome, ("desc", "outcomeName", "selectionName", "name"),
+                "Selection unavailable",
+            )
+        else:
+            market_name = "Selection market needs verification"
+            selection_name = "Selected outcome not identifiable"
+            odds = None
 
-        selections = list(selection_quotes.values())
-        best = []
-
-        for options in selections:
-            # Only use one best price per named bookmaker.
-            named = [
-                q for q in options
-                if clean_string(q.get("bookmaker")) and valid_odds(q["odds"])
-            ]
-            if not named:
-                best = []
-                break
-            best.append(max(named, key=lambda q: q["odds"]))
-
-        if len(best) != 2:
-            continue
-        if normalise_text(best[0]["selection"]) == normalise_text(
-            best[1]["selection"]
-        ):
-            continue
-        if normalise_text(best[0]["bookmaker"]) == normalise_text(
-            best[1]["bookmaker"]
-        ):
-            continue
-
-        inverse_sum = sum(1.0 / q["odds"] for q in best)
-        if inverse_sum >= 1.0:
-            continue
-
-        candidates.append({
-            "event": best[0]["event"],
-            "market": best[0]["market"],
-            "outcomes": [
-                {
-                    "selection": q["selection"],
-                    "odds": q["odds"],
-                    "bookmaker": q["bookmaker"],
-                    "source": q.get("source_host", ""),
-                }
-                for q in best
-            ],
-            "implied_probability_sum": round(inverse_sum, 6),
-            "theoretical_margin_percent": round(
-                (1.0 - inverse_sum) * 100.0, 3
-            ),
-            "status": "candidate_requires_manual_verification",
-            "warning": (
-                "Verify market rules, settlement, limits, timestamps, "
-                "price availability, and independent bookmaker access."
+        legs.append({
+            "number": index + 1,
+            "event": str(event),
+            "market": str(market_name),
+            "selection": str(selection_name),
+            "odds": odds,
+            "odds_verified": odds is not None,
+            "kickoff": first_value(
+                item, ("estimateStartTime", "matchTime", "startTime", "eventTime"), None
             ),
         })
 
-    return sorted(
-        candidates,
-        key=lambda item: item["theoretical_margin_percent"],
-        reverse=True,
+    if not legs:
+        return {
+            "ok": False,
+            "error": (
+                "No recognizable selections returned. The code may be invalid, "
+                "or SportyBet's unofficial endpoint may have changed."
+            ),
+        }
+
+    raw_source_selections = ticket.get("selections")
+    source_count = (
+        len(raw_source_selections)
+        if isinstance(raw_source_selections, list) and raw_source_selections
+        else len(legs)
+    )
+    odds_list = [leg["odds"] for leg in legs if leg["odds_verified"]]
+    calculated = (
+        math.prod(odds_list)
+        if len(odds_list) == len(legs) and legs
+        else None
+    )
+    source_total = finite_number(ticket.get("displayTotalOdds"), minimum=1.000001)
+    status = first_value(
+        ticket, ("status", "orderStatus", "betStatus", "state"), "Not provided"
     )
 
+    result = {
+        "ok": True,
+        "bookmaker": "SportyBet",
+        "bookmaker_key": "sportybet",
+        "bookmaker_identification": "Confirmed by successful SportyBet lookup",
+        "displayed_selections_count": len(legs),
+        "source_selection_count": source_count,
+        "legs": legs,
+        "source_combined_odds": source_total,
+        "calculated_combined_odds": calculated,
+        "odds_agree": (
+            None if source_total is None or calculated is None
+            else math.isclose(source_total, calculated, rel_tol=0.005)
+        ),
+        "status": status,
+        "stake": scalar(ticket.get("totalStake")),
+        "potential_return": scalar(ticket.get("potentialWinnings")),
+        "currency": None,
+        "retrieved_at": now_iso(),
+        "note": (
+            "Read-only lookup from an unofficial SportyBet endpoint. "
+            "Stake/return units and currency are unverified. "
+            "Verify the full ticket on the bookmaker's own site."
+        ),
+    }
 
-def run_scan(trigger="manual"):
-    if not SCAN_LOCK.acquire(blocking=False):
-        return {
-            "status": "already_running",
-            "message": "A scan is already running.",
-        }
-
-    started = utc_now()
+    global LAST_LOOKUP
     with STATE_LOCK:
-        STATE["last_scan_started_at"] = started
-        STATE["last_scan_status"] = "running"
+        LAST_LOOKUP = {
+            "at": result["retrieved_at"],
+            "displayed_selections": len(legs),
+            "source_selections": source_count,
+            "bookmaker": "SportyBet",
+        }
+    return result
 
+
+# ---------------------------------------------------------------------
+# Odds feed normalization and analysis
+# ---------------------------------------------------------------------
+
+def prepare_feed_request(bookmaker_key, configured_url):
+    """Resolve homepage URLs to source-specific public data candidates.
+
+    These are candidates, not guarantees: the bookmaker can change or restrict them.
+    """
+    if not configured_url:
+        return configured_url, {}
     try:
-        quotes, feed_health, reached = fetch_configured_markets()
-        candidates = scan_arbitrage(quotes)
+        parsed = urlsplit(configured_url)
+    except ValueError:
+        return configured_url, {}
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.rstrip("/").lower()
 
-        stored = store_quotes(quotes)
-        finished = utc_now()
+    if bookmaker_key == "sportybet":
+        is_site = host == "sportybet.com" or host.endswith(".sportybet.com")
+        if is_site and "/api/" not in path:
+            params = {
+                "sportId": "sr:sport:1",
+                "marketId": "1,18,10,29,11,26,36,14,60100",
+                "pageSize": "100", "pageNum": "1", "todayGames": "false",
+                "_t": str(int(time.time() * 1000)),
+            }
+            url = "https://www.sportybet.com/api/ng/factsCenter/pcUpcomingEvents?" + urlencode(params)
+            return url, {
+                "Accept": "application/json, text/plain, */*", "Current-Country": "NG",
+                "Origin": "https://www.sportybet.com", "Referer": "https://www.sportybet.com/ng/",
+            }
+        return configured_url, {"Current-Country": "NG", "Referer": "https://www.sportybet.com/ng/"}
 
-        if not MARKET_FEED_URLS:
-            status = "no_feeds_configured"
-        elif reached == 0:
-            status = "feeds_unavailable"
-        elif not quotes:
-            status = "no_usable_quotes"
-        else:
-            status = "completed"
+    if bookmaker_key == "bet9ja":
+        # The configured /Sport/Odds page is HTML. Use the documented MarketWS XML operation.
+        if host in ("web.bet9ja.com", "www.bet9ja.com") and ("marketws.asmx" in path or path == "/sport/odds" or path == ""):
+            return "https://web.bet9ja.com/Controls/MarketWS.asmx", {"Referer": "https://web.bet9ja.com/Sport/Odds", "Accept": "text/xml, application/xml, */*"}
+        if host.endswith("bet9ja.com") and "/controls/marketws.asmx" in path:
+            return configured_url, {"Referer": "https://web.bet9ja.com/Sport/Odds", "Accept": "text/xml, application/xml, */*"}
 
-        summary = {
-            "trigger": trigger,
-            "status": status,
-            "started_at": started,
-            "finished_at": finished,
-            "configured_feed_count": len(MARKET_FEED_URLS),
-            "feeds_reached": reached,
-            "quote_count": len(quotes),
-            "snapshots_stored": stored,
-            "candidate_count": len(candidates),
-            "feed_health": feed_health,
-            "candidates": candidates[:100],
-        }
+    if bookmaker_key == "1xbet":
+        # Public LineFeed endpoint candidate for football fixtures. The adapter only accepts
+        # actual market/outcome odds fields; fixture names alone are never treated as odds.
+        if host == "1xbet.ng" or host.endswith(".1xbet.ng"):
+            if "/linefeed/" not in path:
+                params = {"sports": "1", "count": "1000", "lng": "en", "mode": "4", "country": "1"}
+                return "https://1xbet.ng/LineFeed/BestGamesExtZip?" + urlencode(params), {"Accept": "application/json, text/plain, */*", "Referer": "https://1xbet.ng/en"}
 
-        store_scan(
-            started, finished, status, len(MARKET_FEED_URLS),
-            reached, len(quotes), len(candidates), summary
-        )
-
-        with STATE_LOCK:
-            STATE["last_scan_finished_at"] = finished
-            STATE["last_scan_status"] = status
-            STATE["last_scan_summary"] = summary
-            STATE["status"] = "online"
-
-        log.info(
-            "Scan finished: trigger=%s status=%s feeds=%s/%s quotes=%s "
-            "candidates=%s",
-            trigger, status, reached, len(MARKET_FEED_URLS),
-            len(quotes), len(candidates),
-        )
-        return summary
-
-    except Exception as exc:
-        finished = utc_now()
-        summary = {
-            "trigger": trigger,
-            "status": "error",
-            "started_at": started,
-            "finished_at": finished,
-            "error": clean_string(str(exc), 300),
-            "configured_feed_count": len(MARKET_FEED_URLS),
-        }
-
-        try:
-            store_scan(
-                started, finished, "error", len(MARKET_FEED_URLS),
-                0, 0, 0, summary
-            )
-        except Exception:
-            log.exception("Could not store failed scan.")
-
-        with STATE_LOCK:
-            STATE["last_scan_finished_at"] = finished
-            STATE["last_scan_status"] = "error"
-            STATE["last_scan_summary"] = summary
-            STATE["status"] = "online"
-
-        log.exception("Scan failed.")
-        return summary
-
-    finally:
-        SCAN_LOCK.release()
+    if bookmaker_key == "betway":
+        # Candidate endpoint documented for Betway's South African site. Nigeria host is
+        # deliberately retained; it may 404 if that regional site uses another backend.
+        if host == "betway.com.ng" or host.endswith(".betway.com.ng"):
+            if "/sportsapi/" not in path:
+                return "https://www.betway.com.ng/sportsapi/br/v1/BetBook/Highlights/", {"Accept": "application/json, text/plain, */*", "Referer": "https://www.betway.com.ng/"}
+    return configured_url, {}
 
 
-def scheduler_loop():
-    log.info("Background scan scheduler enabled: interval=%s seconds",
-             SCAN_INTERVAL_SECONDS)
+def adapt_sportybet_payload(payload):
+    """Convert SportyBet's nested factsCenter response into normalized event-market records.
 
-    # Start with a brief delay so the HTTP server can initialize.
-    time.sleep(5)
-
-    while True:
-        try:
-            run_scan(trigger="scheduler")
-        except Exception:
-            log.exception("Scheduler cycle failed.")
-        time.sleep(SCAN_INTERVAL_SECONDS)
-
-
-# ------------------------------------------------------------
-# SportyBet best-effort share-code lookup
-# ------------------------------------------------------------
-
-def walk_dicts(value, depth=0):
-    if depth > 12:
-        return
-    if isinstance(value, dict):
-        yield value
-        for child in value.values():
-            yield from walk_dicts(child, depth + 1)
-    elif isinstance(value, list):
-        for child in value[:500]:
-            yield from walk_dicts(child, depth + 1)
-
-
-def parse_sportybet_outcomes(payload):
-    """
-    Heuristic parser only. The share endpoint/schema is unofficial and
-    unverified; a response may not be parseable or may change at any time.
-    """
-    results = []
-
-    for item in walk_dicts(payload):
-        event = first_value(
-            item, ["eventName", "matchName", "fixtureName", "event_name"]
-        )
-        market = first_value(
-            item, ["marketName", "market_name", "marketDesc"]
-        )
-        selection = first_value(
-            item, ["outcomeName", "selectionName", "specifierName",
-                   "outcome_name", "selection"]
-        )
-        odds = first_value(
-            item, ["odds", "oddValue", "oddsValue", "decimalOdds"]
-        )
-
-        if event and market and selection and valid_odds(odds):
-            results.append({
-                "event": clean_string(event, 250),
-                "market": clean_string(market, 150),
-                "selection": clean_string(selection, 150),
-                "odds": float(odds),
-            })
-
-    # Remove repeated nested representations.
-    unique = {}
-    for item in results:
-        key = (
-            normalise_text(item["event"]),
-            normalise_text(item["market"]),
-            normalise_text(item["selection"]),
-            item["odds"],
-        )
-        unique[key] = item
-
-    return list(unique.values())[:500]
-
-
-def lookup_sportybet(code):
-    # Never log or persist the submitted share code.
-    if not ENABLE_SPORTYBET_LOOKUP:
-        return {
-            "status": "disabled",
-            "message": "SportyBet lookup is disabled by configuration.",
-            "outcomes": [],
-        }
-
-    code = clean_string(code, 160)
-    if not re.fullmatch(r"[A-Za-z0-9_-]{4,160}", code):
-        return {
-            "status": "invalid_code_format",
-            "message": "The share code format was not accepted.",
-            "outcomes": [],
-        }
-
-    # Unofficial endpoint. Its availability and schema are not verified.
-    url = "https://www.sportybet.com/api/ng/orders/share/" + code
-
-    try:
-        payload = fetch_json(url)
-        outcomes = parse_sportybet_outcomes(payload)
-        status = "parsed" if outcomes else "response_unrecognised"
-
-        db_execute(
-            "INSERT INTO lookup_events "
-            "(created_at, status, outcome_count, note) VALUES (?, ?, ?, ?)",
-            (
-                utc_now(), status, len(outcomes),
-                "Share code not stored; unofficial endpoint unverified.",
-            ),
-        )
-
-        with STATE_LOCK:
-            STATE["last_lookup_status"] = status
-
-        return {
-            "status": status,
-            "endpoint_live_verified": False,
-            "message": (
-                "Best-effort response parsing only. This endpoint is "
-                "unofficial and may change."
-            ),
-            "outcomes": outcomes,
-        }
-
-    except Exception as exc:
-        status = "lookup_failed"
-        db_execute(
-            "INSERT INTO lookup_events "
-            "(created_at, status, outcome_count, note) VALUES (?, ?, ?, ?)",
-            (
-                utc_now(), status, 0,
-                "Share code not stored. " + clean_string(str(exc), 180),
-            ),
-        )
-        with STATE_LOCK:
-            STATE["last_lookup_status"] = status
-
-        return {
-            "status": status,
-            "endpoint_live_verified": False,
-            "message": (
-                "Lookup failed. The code was not stored. The endpoint "
-                "or response format may be unavailable or unsupported."
-            ),
-            "outcomes": [],
-        }
-
-
-# ------------------------------------------------------------
-# Analysis endpoint
-# ------------------------------------------------------------
-
-def analyse_ticket(payload):
-    """
-    Analyse a small user-submitted list of selections without saving it.
-    This endpoint does not place bets or verify market availability.
+    Documented shape: data.tournaments[].events[].markets[].outcomes[].
+    This adapter deliberately does not invent probabilities or update timestamps.
     """
     if not isinstance(payload, dict):
-        raise ValueError("Expected a JSON object.")
+        return None, 0, "SportyBet JSON root is not an object"
+    biz_code = payload.get("bizCode")
+    if biz_code is not None and str(biz_code) not in ("10000", "0"):
+        return None, 0, f"SportyBet API returned bizCode {biz_code}"
 
-    picks = payload.get("picks")
-    if not isinstance(picks, list) or not 1 <= len(picks) <= 50:
-        raise ValueError("Provide between 1 and 50 picks.")
+    data = payload.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("tournaments"), list):
+        return None, 0, "JSON received, but expected data.tournaments array from SportyBet factsCenter"
 
-    combined_odds = 1.0
-    clean_picks = []
-
-    for pick in picks:
-        if not isinstance(pick, dict):
-            raise ValueError("Each pick must be an object.")
-
-        odds = safe_float(pick.get("odds"))
-        if not valid_odds(odds):
-            raise ValueError("Each pick needs decimal odds between 1.01 and 1000.")
-
-        combined_odds *= odds
-        clean_picks.append({
-            "event": clean_string(pick.get("event"), 200),
-            "selection": clean_string(pick.get("selection"), 150),
-            "odds": odds,
-        })
-
-    return {
-        "status": "calculated",
-        "pick_count": len(clean_picks),
-        "combined_decimal_odds": round(combined_odds, 6),
-        "break_even_probability_percent": round(
-            100.0 / combined_odds, 6
-        ),
-        "picks": clean_picks,
-        "warning": (
-            "Mathematical break-even only. This is not a forecast of "
-            "success; selections may be correlated and odds can change."
-        ),
-        "stored": False,
-    }
-
-
-# ------------------------------------------------------------
-# Health, state and history
-# ------------------------------------------------------------
-
-def data_health():
-    quote_rows = db_query(
-        "SELECT COUNT(*) AS n FROM market_quotes"
-    )
-    scan_rows = db_query(
-        "SELECT COUNT(*) AS n FROM scan_runs"
-    )
-    latest_quotes = db_query(
-        "SELECT MAX(captured_at) AS latest FROM market_quotes"
-    )
-
-    with STATE_LOCK:
-        last_status = STATE["last_scan_status"]
-        last_finished = STATE["last_scan_finished_at"]
-
-    return {
-        "database_path": DATABASE_PATH,
-        "database_persistent": (
-            DATABASE_PATH != ":memory:"
-            and not DATABASE_PATH.startswith("/tmp/")
-        ),
-        "configured_market_feed_count": len(MARKET_FEED_URLS),
-        "stored_quote_snapshot_rows": quote_rows[0]["n"],
-        "stored_scan_runs": scan_rows[0]["n"],
-        "latest_quote_capture_at": latest_quotes[0]["latest"],
-        "last_scan_status": last_status,
-        "last_scan_finished_at": last_finished,
-        "quote_retention_days": QUOTE_RETENTION_DAYS,
-        "note": (
-            "Snapshot history begins when this version stores quotes. "
-            "No feed configuration means no live market prices."
-        ),
-    }
+    normalized = []
+    raw_market_count = 0
+    for tournament in data.get("tournaments", []):
+        if not isinstance(tournament, dict):
+            continue
+        tournament_name = str(tournament.get("name") or tournament.get("categoryName") or "Unknown league")
+        events = tournament.get("events")
+        if not isinstance(events, list):
+            continue
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            home = str(event.get("homeTeamName") or "").strip()
+            away = str(event.get("awayTeamName") or "").strip()
+            if not home or not away:
+                continue
+            event_name = f"{home} vs {away}"
+            markets = event.get("markets")
+            if not isinstance(markets, list):
+                continue
+            for market in markets:
+                if not isinstance(market, dict):
+                    continue
+                raw_market_count += 1
+                outcomes = market.get("outcomes")
+                if not isinstance(outcomes, list):
+                    continue
+                parsed_outcomes = []
+                for outcome in outcomes:
+                    if not isinstance(outcome, dict):
+                        continue
+                    odds = finite_number(outcome.get("odds"), minimum=1.000001)
+                    name = str(outcome.get("desc") or outcome.get("name") or "").strip()
+                    if odds is None or not name or outcome.get("isActive") is False:
+                        continue
+                    parsed_outcomes.append({
+                        "name": name,
+                        "odds": odds,
+                        # SportyBet's ordinary odds response does not provide a validated
+                        # model probability; never manufacture one from the odds.
+                    })
+                market_name = str(market.get("desc") or market.get("name") or "").strip()
+                specifier = str(market.get("specifier") or "").strip()
+                if specifier:
+                    market_name = f"{market_name} {specifier}".strip()
+                if not market_name:
+                    continue
+                normalized.append({
+                    "sport": "Football",
+                    "event": event_name,
+                    "market": market_name,
+                    "outcomes": parsed_outcomes,
+                    # Do not use scheduled kick-off as an odds-update timestamp.
+                    "updated_at": first_value(market, ["updated_at", "updatedAt", "lastUpdateTime", "updateTime"]),
+                    "league": tournament_name,
+                })
+    return normalized, raw_market_count, "SportyBet nested schema recognized"
 
 
-def health_payload():
-    with STATE_LOCK:
-        state_copy = dict(STATE)
+def normalize_feed_event(bookmaker_key, raw):
+    if not isinstance(raw, dict):
+        return None
+    sport = str(raw.get("sport") or "Unknown sport").strip()
+    event = str(raw.get("event") or raw.get("fixture") or "").strip()
+    market = str(raw.get("market") or "").strip()
+    outcomes = raw.get("outcomes")
+    if not event or not market or not isinstance(outcomes, list):
+        return None
 
-    return {
-        "status": "online",
-        "service": APP_NAME,
-        "version": VERSION,
-        "read_only": True,
-        "configured_market_feed_count": len(MARKET_FEED_URLS),
-        "last_scan_status": state_copy["last_scan_status"],
-        "last_lookup_status": state_copy["last_lookup_status"],
-        "database_path": DATABASE_PATH,
-        "database_persistent": (
-            DATABASE_PATH != ":memory:"
-            and not DATABASE_PATH.startswith("/tmp/")
-        ),
-        "note": "Online status does not prove bookmaker endpoint or feed availability.",
-    }
-
-
-def get_history(limit=30):
-    limit = max(1, min(100, int(limit)))
-    rows = db_query(
-        """
-        SELECT id, started_at, finished_at, status, feed_count,
-               feeds_reached, quote_count, candidate_count, summary_json
-        FROM scan_runs
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (limit,),
-    )
-
-    for row in rows:
-        try:
-            row["summary"] = json.loads(row.pop("summary_json") or "{}")
-        except Exception:
-            row["summary"] = {}
-            row.pop("summary_json", None)
-
-    return rows
-
-
-# ------------------------------------------------------------
-# PWA resources
-# ------------------------------------------------------------
-
-MANIFEST = {
-    "name": APP_NAME,
-    "short_name": "SolveEase",
-    "description": "Read-only football market research and odds analysis.",
-    "start_url": "/",
-    "scope": "/",
-    "display": "standalone",
-    "background_color": "#08111f",
-    "theme_color": "#08111f",
-    "icons": [
-        {
-            "src": "/icon.svg",
-            "sizes": "any",
-            "type": "image/svg+xml",
-            "purpose": "any maskable",
-        }
-    ],
-}
-
-ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
-<rect width="128" height="128" rx="28" fill="#08111f"/>
-<path d="M30 38h68M30 64h46M30 90h58" stroke="#69e0bb"
-stroke-width="9" stroke-linecap="round"/>
-<circle cx="94" cy="64" r="12" fill="#69e0bb"/>
-</svg>"""
-
-SERVICE_WORKER = r"""
-const CACHE = "solveease-shell-v7";
-const SHELL = ["/", "/manifest.webmanifest", "/icon.svg"];
-self.addEventListener("install", event => {
-  event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)));
-  self.skipWaiting();
-});
-self.addEventListener("activate", event => {
-  event.waitUntil(
-    caches.keys().then(keys => Promise.all(
-      keys.filter(key => key !== CACHE).map(key => caches.delete(key))
-    ))
-  );
-  self.clients.claim();
-});
-self.addEventListener("fetch", event => {
-  const url = new URL(event.request.url);
-  if (url.origin !== self.location.origin) return;
-  if (url.pathname.startsWith("/api/") ||
-      ["/health", "/healthz", "/state"].includes(url.pathname)) return;
-
-  if (event.request.method !== "GET") return;
-  event.respondWith(
-    fetch(event.request).then(response => {
-      if (response.ok && (url.pathname === "/" ||
-          url.pathname === "/manifest.webmanifest" ||
-          url.pathname === "/icon.svg")) {
-        const copy = response.clone();
-        caches.open(CACHE).then(cache => cache.put(event.request, copy));
-      }
-      return response;
-    }).catch(() => caches.match(event.request))
-  );
-});
-"""
-
-
-# ------------------------------------------------------------
-# Server-rendered multi-page website
-# ------------------------------------------------------------
-
-NAV_ITEMS = [
-    ("/", "Overview"),
-    ("/scanner", "Market scanner"),
-    ("/matches", "Match intelligence"),
-    ("/risk-lab", "Accumulator lab"),
-    ("/history", "Scan history"),
-    ("/data-health", "Data health"),
-    ("/reports", "Research & reports"),
-]
-
-
-def page_content(path):
-    if path == "/":
-        return "Overview", """
-        <section class="hero">
-          <p class="eyebrow">READ-ONLY MARKET RESEARCH</p>
-          <h1>See the market clearly.</h1>
-          <p class="lead">Review configured odds sources, inspect scan results,
-          and calculate accumulator mathematics without placing bets.</p>
-          <div class="actions">
-            <a class="button primary" href="/scanner">Open market scanner</a>
-            <a class="button secondary" href="/risk-lab">Open accumulator lab</a>
-          </div>
-        </section>
-        <section class="grid metrics">
-          <article class="metric"><span>Service</span><strong id="service-status">Loading…</strong></article>
-          <article class="metric"><span>Configured feeds</span><strong id="feed-count">—</strong></article>
-          <article class="metric"><span>Last scan</span><strong id="scan-status">—</strong></article>
-          <article class="metric"><span>Stored snapshots</span><strong id="snapshot-count">—</strong></article>
-        </section>
-        <section class="panel">
-          <div class="section-heading"><div><p class="eyebrow">CURRENT REALITY</p>
-          <h2>What the system can verify</h2></div></div>
-          <p id="reality">Checking service data…</p>
-          <p class="muted">A live website does not mean a live bookmaker feed is connected.
-          Candidate prices require manual verification before any real-world decision.</p>
-        </section>
-        <section class="grid cards">
-          <a class="feature" href="/scanner"><span class="feature-icon">↗</span>
-            <h3>Market scanner</h3><p>Inspect feed health and scan for conservative two-outcome candidates.</p></a>
-          <a class="feature" href="/matches"><span class="feature-icon">◎</span>
-            <h3>Match intelligence</h3><p>Review available market records. Team form and H2H require historical data.</p></a>
-          <a class="feature" href="/risk-lab"><span class="feature-icon">∑</span>
-            <h3>Accumulator lab</h3><p>Calculate combined decimal odds and break-even probability.</p></a>
-          <a class="feature" href="/history"><span class="feature-icon">◷</span>
-            <h3>Scan history</h3><p>View saved scan runs and snapshots from this deployment onward.</p></a>
-        </section>
-        """
-
-    if path == "/scanner":
-        return "Market scanner", """
-        <section class="page-intro"><p class="eyebrow">MARKET MONITORING</p>
-        <h1>Market scanner</h1>
-        <p class="lead">Fetch configured feeds and inspect scan results. A manual scan
-        may take several seconds depending on provider response times.</p></section>
-        <section class="panel">
-          <div class="actions"><button class="button primary" id="run-scan">Run scan now</button>
-          <button class="button secondary" id="refresh-scan">Refresh status</button></div>
-          <p id="scan-message" class="notice">Ready to check feed availability.</p>
-          <div id="feed-list"></div>
-          <div id="candidate-list"></div>
-        </section>
-        """
-
-    if path == "/matches":
-        return "Match intelligence", """
-        <section class="page-intro"><p class="eyebrow">FIXTURES & MARKET CONTEXT</p>
-        <h1>Match intelligence</h1>
-        <p class="lead">This page only displays information available from configured
-        feeds. It does not invent fixtures, team form, head-to-head results, or predictions.</p></section>
-        <section class="panel"><h2>Available market records</h2>
-        <p id="match-data-note">Loading data health…</p>
-        <p class="muted">Fixture lists, team form, H2H and validated probability forecasts
-        need suitable authorized sources and validated models; they are not generated here.</p>
-        <a class="button secondary" href="/data-health">Inspect data health</a></section>
-        """
-
-    if path == "/risk-lab":
-        return "Accumulator lab", """
-        <section class="page-intro"><p class="eyebrow">MATHEMATICAL TOOL</p>
-        <h1>Accumulator lab</h1>
-        <p class="lead">Calculate combined odds and theoretical break-even probability.
-        This is not a prediction or a recommendation to place a bet.</p></section>
-        <section class="panel">
-          <label for="pick-count">Number of selections</label>
-          <select id="pick-count">
-            <option value="1">1 selection</option><option value="2">2 selections</option>
-            <option value="3" selected>3 selections</option><option value="4">4 selections</option>
-            <option value="5">5 selections</option><option value="6">6 selections</option>
-            <option value="7">7 selections</option><option value="8">8 selections</option>
-            <option value="9">9 selections</option><option value="10">10 selections</option>
-          </select>
-          <div id="odds-inputs" class="odds-grid"></div>
-          <button class="button primary" id="calculate">Calculate</button>
-          <div id="calculation-result" class="result-box" aria-live="polite"></div>
-          <p class="muted">Actual outcomes can be dependent, odds can change, and bookmaker
-          settlement rules may differ. The calculation does not estimate true win probability.</p>
-        </section>
-        """
-
-    if path == "/history":
-        return "Scan history", """
-        <section class="page-intro"><p class="eyebrow">AUDIT TRAIL</p>
-        <h1>Scan history</h1>
-        <p class="lead">Saved scan summaries, source reachability and quote counts.</p></section>
-        <section class="panel"><button class="button secondary" id="refresh-history">Refresh history</button>
-        <div id="history-list" class="table-wrap"></div></section>
-        """
-
-    if path == "/data-health":
-        return "Data health", """
-        <section class="page-intro"><p class="eyebrow">SOURCE TRANSPARENCY</p>
-        <h1>Data health</h1>
-        <p class="lead">Check whether feeds are configured, whether quote snapshots exist,
-        and whether the database path is persistent.</p></section>
-        <section class="panel"><button class="button secondary" id="refresh-health">Refresh data health</button>
-        <pre id="health-json" class="json-view">Loading…</pre>
-        <div class="notice">Never paste secrets or API tokens into this page. Configure feeds
-        through server environment variables only.</div></section>
-        """
-
-    if path == "/reports":
-        return "Research & reports", """
-        <section class="page-intro"><p class="eyebrow">CAPABILITY REGISTER</p>
-        <h1>Research & reports</h1>
-        <p class="lead">A clear distinction between working calculations and capabilities
-        that need additional data or validated models.</p></section>
-        <section class="grid cards">
-          <article class="feature"><span class="status-pill active">Available</span>
-            <h3>Accumulator mathematics</h3><p>Combined decimal odds and theoretical break-even probability.</p></article>
-          <article class="feature"><span class="status-pill active">Conditional</span>
-            <h3>Market scanning</h3><p>Only configured feeds with supported JSON formats; arbitrage checks require
-            explicit exhaustive two-outcome markets.</p></article>
-          <article class="feature"><span class="status-pill pending">Needs source</span>
-            <h3>Fixtures, form & H2H</h3><p>Requires authorized fixture and historical match data.</p></article>
-          <article class="feature"><span class="status-pill pending">Needs model</span>
-            <h3>Fair odds & value</h3><p>Requires documented, validated probability estimates.</p></article>
-          <article class="feature"><span class="status-pill pending">Future work</span>
-            <h3>Forecast track record</h3><p>Requires stored forecasts and verified final results.</p></article>
-          <article class="feature"><span class="status-pill pending">Future work</span>
-            <h3>Watchlists & alerts</h3><p>Not implemented in this release.</p></article>
-        </section>
-        """
-
-    return "Not found", """
-    <section class="page-intro"><h1>Page not found</h1>
-    <p class="lead">This page does not exist.</p><a class="button primary" href="/">Return to overview</a></section>
-    """
-
-
-CSS = r"""
-:root{color-scheme:dark;--bg:#08111f;--panel:#101d2f;--panel2:#14243a;
---text:#edf4ff;--muted:#9eb0c8;--line:#263b55;--mint:#69e0bb;--blue:#9ac7ff;
---warning:#ffd58b;--radius:18px;font-family:Inter,-apple-system,BlinkMacSystemFont,
-"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
-*{box-sizing:border-box}html{background:var(--bg);scroll-behavior:smooth}
-body{margin:0;background:radial-gradient(ellipse at 70% -15%,#183455 0,transparent 45%),var(--bg);
-color:var(--text);min-height:100vh;padding-bottom:env(safe-area-inset-bottom)}
-a{color:inherit;text-decoration:none}button,input,select{font:inherit}
-a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid var(--mint);outline-offset:3px}
-.topbar{position:sticky;top:0;z-index:5;background:#08111feF;border-bottom:1px solid var(--line);
-backdrop-filter:blur(14px);padding:calc(12px + env(safe-area-inset-top)) max(18px,env(safe-area-inset-right)) 12px max(18px,env(safe-area-inset-left))}
-.topinner{max-width:1180px;margin:auto;display:flex;align-items:center;justify-content:space-between;gap:16px}
-.brand{display:flex;align-items:center;gap:11px;font-weight:800;letter-spacing:-.03em}
-.logo{width:37px;height:37px;border-radius:12px;background:#132b3c;color:var(--mint);display:grid;place-items:center;font-size:23px}
-.brand small{display:block;color:var(--muted);font-size:10px;font-weight:600;letter-spacing:.13em;margin-top:3px}
-.top-status{font-size:12px;color:var(--mint);display:flex;align-items:center;gap:8px}
-.dot{width:8px;height:8px;background:var(--mint);border-radius:50%;display:inline-block}
-.layout{max-width:1180px;margin:auto;padding:24px 20px 50px;display:grid;grid-template-columns:205px minmax(0,1fr);gap:26px}
-.sidebar{align-self:start;position:sticky;top:85px;display:flex;flex-direction:column;gap:6px}
-.navlink{padding:12px 13px;border:1px solid transparent;border-radius:12px;color:var(--muted);font-size:14px}
-.navlink:hover,.navlink.current{background:var(--panel);border-color:var(--line);color:var(--text)}
-.navlink.current{box-shadow:inset 3px 0 var(--mint)}
-.content{min-width:0}.hero,.page-intro{padding:28px 0 24px}
-.eyebrow{font-size:10px;font-weight:800;letter-spacing:.17em;color:var(--mint);margin:0 0 12px}
-h1{font-size:clamp(31px,5vw,48px);line-height:1.08;letter-spacing:-.045em;margin:0 0 15px}
-h2{font-size:21px;letter-spacing:-.025em;margin:0 0 12px}
-h3{font-size:17px;margin:13px 0 8px}.lead{color:#c0cee0;line-height:1.7;max-width:720px;font-size:16px}
-.muted{color:var(--muted);font-size:13px;line-height:1.65}
-.actions{display:flex;flex-wrap:wrap;gap:10px;margin:22px 0}
-.button{border:1px solid var(--line);border-radius:12px;padding:12px 16px;min-height:44px;
-display:inline-flex;align-items:center;justify-content:center;cursor:pointer;font-weight:700;font-size:13px}
-.button.primary{background:var(--mint);color:#082018;border-color:var(--mint)}
-.button.secondary{background:var(--panel);color:var(--text)}
-.button:disabled{opacity:.5;cursor:wait}
-.grid{display:grid;gap:13px}.metrics{grid-template-columns:repeat(4,minmax(0,1fr));margin:8px 0 18px}
-.metric,.panel,.feature{border:1px solid var(--line);background:linear-gradient(145deg,#122137,#0d1929);
-border-radius:var(--radius);padding:19px;min-width:0}
-.metric span{font-size:12px;color:var(--muted);display:block;margin-bottom:11px}
-.metric strong{font-size:clamp(16px,2.3vw,24px);overflow-wrap:anywhere}
-.panel{margin:14px 0 18px}.section-heading{display:flex;justify-content:space-between;gap:16px}
-.cards{grid-template-columns:repeat(2,minmax(0,1fr));margin-top:18px}
-.feature{display:block;transition:transform .15s,border-color .15s}.feature:hover{transform:translateY(-2px);border-color:#55718d}
-.feature p{color:var(--muted);font-size:13px;line-height:1.65;margin-bottom:0}
-.feature-icon{display:grid;place-items:center;width:38px;height:38px;border-radius:12px;background:#1b3548;color:var(--mint);font-size:22px}
-.notice{border:1px solid #66512d;background:#2a2418;color:var(--warning);border-radius:12px;padding:13px;line-height:1.6;font-size:13px;margin:15px 0}
-.status-pill{display:inline-flex;font-size:10px;letter-spacing:.04em;border-radius:100px;padding:5px 8px}
-.status-pill.active{background:#14382f;color:var(--mint)}.status-pill.pending{background:#2a2a32;color:#d4c7a8}
-label{display:block;font-size:13px;color:#c4d2e4;margin:16px 0 8px}
-input,select{width:100%;min-height:45px;border-radius:11px;border:1px solid var(--line);background:#081422;color:var(--text);padding:10px 12px}
-.odds-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:15px 0}
-.result-box{margin-top:18px;border-radius:13px;background:#0a1724;border:1px solid var(--line);padding:17px;line-height:1.8}
-.result-big{font-size:28px;color:var(--mint);font-weight:800;overflow-wrap:anywhere}
-.json-view{white-space:pre-wrap;overflow-wrap:anywhere;background:#07111d;border:1px solid var(--line);border-radius:12px;padding:15px;color:#c6d8ed;font-size:12px;line-height:1.65}
-.table-wrap{overflow-x:auto;margin-top:14px}table{width:100%;border-collapse:collapse;min-width:620px;font-size:12px}
-th,td{text-align:left;padding:12px;border-bottom:1px solid var(--line);vertical-align:top}
-th{color:var(--muted);font-weight:700}td{color:#dce8f7}.candidate{padding:15px 0;border-bottom:1px solid var(--line)}
-.candidate:last-child{border-bottom:0}.candidate strong{color:var(--mint)}
-footer{max-width:1180px;margin:auto;padding:0 20px 30px;color:var(--muted);font-size:11px;line-height:1.7}
-.mobile-nav{display:none}
-@media(max-width:800px){.layout{grid-template-columns:1fr;padding:12px 14px 36px;gap:12px}
-.sidebar{position:static;display:flex;flex-direction:row;overflow-x:auto;gap:7px;padding:3px 0 9px;scrollbar-width:thin}
-.navlink{white-space:nowrap;padding:10px 12px;font-size:12px}.navlink.current{box-shadow:inset 0 -3px var(--mint)}
-.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.metric{padding:15px}
-.hero,.page-intro{padding:22px 0 17px}.top-status{font-size:0}.top-status .dot{font-size:initial}
-}
-@media(max-width:470px){.cards{grid-template-columns:1fr}.odds-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
-.panel{padding:15px}.brand{font-size:13px}.brand small{font-size:9px}.topinner{gap:8px}
-h1{font-size:34px}.lead{font-size:14px}.button{padding:11px 13px}}
-@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
-"""
-
-
-def render_page(path):
-    title, content = page_content(path)
-    nav = []
-    for href, label in NAV_ITEMS:
-        current = " current" if href == path else ""
-        current_attr = ' aria-current="page"' if href == path else ""
-        nav.append(
-            f'<a class="navlink{current}" href="{escape(href)}"'
-            f'{current_attr}>{escape(label)}</a>'
+    unique = {}
+    for outcome in outcomes:
+        if not isinstance(outcome, dict):
+            continue
+        name = str(outcome.get("name") or outcome.get("selection") or "").strip()
+        odds = finite_number(outcome.get("odds"), minimum=1.000001)
+        if not name or odds is None:
+            continue
+        key = normalize_text(name)
+        if not key:
+            continue
+        probability = finite_number(
+            outcome.get("estimated_probability"), minimum=0, maximum=1
         )
+        unique[key] = {
+            "name": name,
+            "name_key": key,
+            "odds": odds,
+            "estimated_probability": probability,
+        }
 
-    js = r"""
-const $ = id => document.getElementById(id);
-async function api(path, options={}) {
-  const response = await fetch(path, {
-    cache: "no-store",
-    headers: {"Content-Type":"application/json", ...(options.headers||{})},
-    ...options
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-  return data;
-}
-function pretty(value){return JSON.stringify(value,null,2);}
-function safe(value){return String(value ?? "").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+    normalized_outcomes = list(unique.values())
+    # Conservative: exactly two unique outcomes per market record.
+    if len(normalized_outcomes) != 2:
+        return None
 
-async function refreshOverview(){
-  try {
-    const [health,data] = await Promise.all([api("/health"),api("/api/data-health")]);
-    if($("service-status")) $("service-status").textContent = health.status;
-    if($("feed-count")) $("feed-count").textContent = data.configured_market_feed_count;
-    if($("scan-status")) $("scan-status").textContent = data.last_scan_status;
-    if($("snapshot-count")) $("snapshot-count").textContent = data.stored_quote_snapshot_rows;
-    if($("reality")) $("reality").textContent =
-      data.configured_market_feed_count === 0
-      ? "No market feeds are configured. Live prices and arbitrage candidates are unavailable until a supported feed is connected."
-      : `${data.configured_market_feed_count} feed(s) configured. Check feed reachability and usable quote counts on the Market Scanner page.`;
-    if($("match-data-note")) $("match-data-note").textContent =
-      `Configured feeds: ${data.configured_market_feed_count}. Stored quote snapshots: ${data.stored_quote_snapshot_rows}. Latest capture: ${data.latest_quote_capture_at || "none"}.`;
-  } catch(e) {
-    if($("reality")) $("reality").textContent = "Could not load service data: " + e.message;
-  }
-}
-
-async function loadScanner(){
-  try {
-    const data = await api("/api/state");
-    const summary = data.last_scan_summary || {};
-    if($("scan-message")) $("scan-message").textContent =
-      `Status: ${data.last_scan_status}. Feeds configured: ${data.configured_market_feed_count}. Last completed: ${data.last_scan_finished_at || "not yet run"}.`;
-    if($("feed-list")) {
-      const feeds = summary.feed_health || [];
-      $("feed-list").innerHTML = "<h2>Feed health</h2>" +
-        (feeds.length ? feeds.map(f=>`<div class="candidate"><strong>${safe(f.host)}</strong><br>Status: ${safe(f.status)} · Quotes: ${safe(f.quotes)}<p class="muted">${safe(f.message)}</p></div>`).join("")
-        : "<p class='muted'>No feed results yet. Configure MARKET_FEED_URLS in the service environment.</p>");
+    return {
+        "bookmaker_key": bookmaker_key,
+        "bookmaker": BOOKMAKERS[bookmaker_key]["name"],
+        "sport": sport,
+        "event": event,
+        "event_key": normalize_text(event),
+        "market": market,
+        "market_key": normalize_text(market),
+        "outcomes": normalized_outcomes,
+        "updated_at": raw.get("updated_at"),
     }
-    if($("candidate-list")) {
-      const candidates = summary.candidates || [];
-      $("candidate-list").innerHTML = "<h2>Candidate review</h2>" +
-        (candidates.length ? candidates.map(c=>`<div class="candidate"><h3>${safe(c.event)} · ${safe(c.market)}</h3><p>${c.outcomes.map(o=>`${safe(o.selection)} @ ${safe(o.odds)} —${safe(o.bookmaker)}`).join("<br>")}</p><strong>Theoretical margin: ${safe(c.theoretical_margin_percent)}%</strong><p class="muted">${safe(c.warning)}</p></div>`).join("")
-        : "<p class='muted'>No eligible candidates in the latest scan. This does not prove that no opportunities exist; feeds may be absent, incomplete, or unsupported.</p>");
+
+
+def safe_fetch_xml(url, label, extra_headers=None):
+    """Fetch public XML without attempting to bypass access controls."""
+    started = time.monotonic()
+    diag = {
+        "http_status": None, "content_type": None, "response_bytes": 0,
+        "fetch_ms": 0, "json_valid": False, "xml_valid": False, "schema_valid": False,
+        "raw_events": 0, "events_loaded": 0, "events_rejected": 0,
+        "rejection_reasons": {}, "last_successful_fetch": None,
+        "data_updated_at": None, "freshness_seconds": None, "stale": None,
+        "detail": "", "status": "not configured",
     }
-  } catch(e) {
-    if($("scan-message")) $("scan-message").textContent = "Unable to load scanner: " + e.message;
-  }
-}
-if($("run-scan")) $("run-scan").addEventListener("click", async () => {
-  const button=$("run-scan"); button.disabled=true; button.textContent="Scanning…";
-  if($("scan-message")) $("scan-message").textContent="Scan started. Waiting for configured sources…";
-  try {
-    const result=await api("/api/scan",{method:"POST",body:JSON.stringify({})});
-    if($("scan-message")) $("scan-message").textContent=`Scan finished: ${result.status}. Quotes: ${result.quote_count ?? 0}. Candidates: ${result.candidate_count ?? 0}.`;
-    await loadScanner();
-  } catch(e) {
-    if($("scan-message")) $("scan-message").textContent="Scan request failed: "+e.message;
-  } finally {button.disabled=false;button.textContent="Run scan now";}
-});
-if($("refresh-scan")) $("refresh-scan").addEventListener("click",loadScanner);
+    if not url:
+        diag["detail"] = "No feed URL configured"
+        return None, diag
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; SolveEaseFeedMonitor/3.3)", "Accept": "text/xml, application/xml, */*"}
+    if extra_headers:
+        headers.update(extra_headers)
+    request = Request(url, headers=headers, method="GET")
+    try:
+        with urlopen(request, timeout=TIMEOUT) as response:
+            diag["http_status"] = int(response.status)
+            diag["content_type"] = response.headers.get("Content-Type", "")[:160]
+            body = response.read(MAX_FEED_BYTES + 1)
+            diag["response_bytes"] = len(body)
+            if len(body) > MAX_FEED_BYTES:
+                diag.update(status="response too large", detail=f"XML response exceeded {MAX_FEED_BYTES} byte limit")
+                return None, diag
+            if not 200 <= response.status < 300:
+                diag.update(status="http error", detail=f"HTTP {response.status}")
+                return None, diag
+    except HTTPError as exc:
+        diag["http_status"] = int(exc.code)
+        diag["content_type"] = exc.headers.get("Content-Type", "")[:160] if exc.headers else ""
+        diag.update(status="http error", detail=f"HTTP {exc.code}")
+        return None, diag
+    except (URLError, TimeoutError, OSError) as exc:
+        diag.update(status="fetch failed", detail=f"Network request failed ({type(exc).__name__})")
+        return None, diag
+    finally:
+        diag["fetch_ms"] = round((time.monotonic() - started) * 1000)
+    try:
+        root = ET.fromstring(body)
+        diag["xml_valid"] = True
+        diag["last_successful_fetch"] = now_iso()
+        diag["status"] = "XML received"
+        return root, diag
+    except ET.ParseError:
+        diag.update(status="invalid response", detail="Response is not parseable XML; endpoint may return HTML or an access page")
+        return None, diag
 
-function renderOddsInputs(){
-  if(!$("odds-inputs")) return;
-  const n=Number($("pick-count").value);
-  $("odds-inputs").innerHTML=Array.from({length:n},(_,i)=>
-    `<div><label for="odd-${i}">Selection ${i+1} odds</label><input id="odd-${i}" inputmode="decimal" type="number" min="1.01" max="1000" step="0.01" placeholder="e.g. 1.85" value="${i<3?["1.85","2.10","1.65"][i]:""}"></div>`
-  ).join("");
-}
-if($("pick-count")) { $("pick-count").addEventListener("change",renderOddsInputs); renderOddsInputs(); }
-if($("calculate")) $("calculate").addEventListener("click",async()=>{
-  const n=Number($("pick-count").value);
-  const picks=[];
-  for(let i=0;i<n;i++){
-    const odds=Number($("odd-"+i).value);
-    if(!Number.isFinite(odds)||odds<1.01||odds>1000){
-      $("calculation-result").textContent=`Enter valid decimal odds for selection ${i+1} (1.01 to 1000).`;return;
+
+def _xml_local(tag):
+    return tag.rsplit("}", 1)[-1].split(":")[-1].lower()
+
+
+def _xml_child_text(node, names):
+    wanted = {n.lower() for n in names}
+    for child in list(node):
+        if _xml_local(child.tag) in wanted and child.text and child.text.strip():
+            return child.text.strip()
+    return ""
+
+
+def fetch_bet9ja_xml(configured_url, headers):
+    """Probe Bet9ja's documented XML service, discover football sport ID, then request odds.
+
+    This uses the published service interface only. It does not evade a 403/WAF response.
+    """
+    base = "https://web.bet9ja.com/Controls/MarketWS.asmx"
+    params = {"strQuotaMax": "1000", "tipoVisQuote": "0"}
+    sport_url = base + "/GetListSport_OddLessThan?" + urlencode(params)
+    root, diag = safe_fetch_xml(sport_url, "Bet9ja sports list", headers)
+    if root is None:
+        diag["bookmaker"] = "Bet9ja"
+        return [], diag
+    sport_id = None
+    for node in root.iter():
+        if _xml_local(node.tag) != "clssportlist":
+            continue
+        name = _xml_child_text(node, ["Sport"])
+        ident = _xml_child_text(node, ["IDSport"])
+        if name and ident and any(word in name.lower() for word in ("football", "soccer", "calcio")):
+            sport_id = ident
+            break
+    if not sport_id:
+        diag.update(status="invalid schema", schema_valid=False, detail="Bet9ja XML parsed, but no football sport ID was identified in the published service response")
+        diag["bookmaker"] = "Bet9ja"
+        return [], diag
+    odds_params = {"strQuotaMax": "1000", "strIDSport": sport_id, "typeOrder": "0", "tipoVisQuote": "0"}
+    odds_url = base + "/GetListOdds_OddLessThan?" + urlencode(odds_params)
+    odds_root, odds_diag = safe_fetch_xml(odds_url, "Bet9ja odds", headers)
+    # Prefer the odds response diagnostics; include both request durations and sizes.
+    odds_diag["fetch_ms"] += diag.get("fetch_ms", 0)
+    odds_diag["response_bytes"] += diag.get("response_bytes", 0)
+    odds_diag["bookmaker"] = "Bet9ja"
+    if odds_root is None:
+        odds_diag["detail"] = "Football sport ID discovered, but the Bet9ja odds operation failed: " + odds_diag.get("detail", "unknown error")
+        return [], odds_diag
+
+    odds_diag["schema_valid"] = True
+    odds_diag["status"] = "XML schema recognized; checking quote fields"
+    odds_diag["last_successful_fetch"] = odds_diag.get("last_successful_fetch") or now_iso()
+    normalized = []
+    # The published service exposes SubEvents, OddClass and Quote/clsQuoteList.
+    # Parse conservatively: only emit a market when two named selections have numeric decimal odds.
+    for subevent in odds_root.iter():
+        if _xml_local(subevent.tag) != "clssubeventslist":
+            continue
+        event_name = _xml_child_text(subevent, ["Evento", "Event", "EventName"])
+        subevent_name = _xml_child_text(subevent, ["SottoEvento", "SubEvent", "Market"])
+        quote_parent = next((c for c in list(subevent) if _xml_local(c.tag) == "quote"), None)
+        if not event_name or quote_parent is None:
+            continue
+        selections = []
+        for quote_node in quote_parent.iter():
+            if quote_node is quote_parent or not list(quote_node):
+                continue
+            fields = {_xml_local(c.tag): (c.text or "").strip() for c in list(quote_node)}
+            odds = None
+            for key, value in fields.items():
+                if any(term in key for term in ("quota", "odd", "price", "value")):
+                    odds = finite_number(value, minimum=1.000001)
+                    if odds is not None:
+                        break
+            label = ""
+            for key, value in fields.items():
+                if value and any(term in key for term in ("name", "desc", "esito", "selection", "segno", "tipo")):
+                    label = value
+                    break
+            if odds is not None and label:
+                selections.append({"name": label, "odds": odds})
+        # Keep unique labels only; skip unclear or 3-way markets.
+        unique = {normalize_text(o["name"]): o for o in selections if normalize_text(o["name"])}
+        if len(unique) == 2:
+            normalized.append({"sport": "Football", "event": event_name, "market": subevent_name or "Bet9ja market", "outcomes": list(unique.values()), "updated_at": None})
+    odds_diag["raw_events"] = sum(1 for n in odds_root.iter() if _xml_local(n.tag) == "clssubeventslist")
+    odds_diag["events_loaded"] = len(normalized)
+    odds_diag["events_rejected"] = max(0, odds_diag["raw_events"] - len(normalized))
+    if normalized:
+        odds_diag.update(status="usable markets; freshness unknown", detail="Bet9ja XML returned named two-outcome markets; update timestamps were not confirmed")
+    elif odds_diag["raw_events"]:
+        odds_diag.update(status="no usable markets", detail="Bet9ja XML parsed, but quote field names/values did not yield exactly two named decimal-odds outcomes; adapter needs a sample response to map safely")
+    else:
+        odds_diag.update(status="no events", detail="Bet9ja XML schema parsed, but no subevents were returned")
+    return normalized, odds_diag
+
+
+def adapt_betway_payload(payload):
+    """Normalize Betway's documented flat event/market/outcome/price arrays when present."""
+    if not isinstance(payload, dict):
+        return None, 0, "Betway JSON root is not an object"
+    def arr(*names):
+        for name in names:
+            value = payload.get(name)
+            if isinstance(value, list):
+                return value
+        return []
+    events = arr("events", "Events", "eventList", "EventList")
+    markets = arr("markets", "Markets", "marketList", "MarketList")
+    outcomes = arr("outcomes", "Outcomes", "selections", "Selections")
+    prices = arr("prices", "Prices", "odds", "Odds")
+    if not events or not markets or not outcomes:
+        return None, len(events), "Valid JSON, but expected Betway flat arrays (events, markets, outcomes, prices) were not all present"
+    def pick(obj, *keys):
+        return first_value(obj, keys)
+    event_by_id = {}
+    for e in events:
+        eid = pick(e, "id", "eventId", "EventId", "eventID", "ID")
+        home = pick(e, "home", "homeName", "Home", "HomeName", "participant1")
+        away = pick(e, "away", "awayName", "Away", "AwayName", "participant2")
+        name = pick(e, "name", "eventName", "EventName", "caption", "Caption")
+        if not name and home and away:
+            name = f"{home} vs {away}"
+        if eid is not None and name:
+            event_by_id[str(eid)] = str(name)
+    outcomes_by_market = {}
+    price_by_outcome = {}
+    for price in prices:
+        oid = pick(price, "outcomeId", "OutcomeId", "selectionId", "SelectionId", "id", "Id")
+        val = pick(price, "odds", "price", "value", "decimalOdds", "DecimalOdds", "Odd")
+        if oid is not None and finite_number(val, minimum=1.000001) is not None:
+            price_by_outcome[str(oid)] = finite_number(val, minimum=1.000001)
+    for o in outcomes:
+        oid = pick(o, "id", "outcomeId", "OutcomeId", "selectionId", "SelectionId", "ID")
+        mid = pick(o, "marketId", "MarketId", "marketID", "parentMarketId")
+        name = pick(o, "name", "outcomeName", "OutcomeName", "caption", "Caption", "description", "Description")
+        odd = finite_number(pick(o, "odds", "price", "value", "decimalOdds", "DecimalOdds", "Odd"), minimum=1.000001)
+        if odd is None and oid is not None:
+            odd = price_by_outcome.get(str(oid))
+        if mid is not None and name and odd is not None:
+            outcomes_by_market.setdefault(str(mid), []).append({"name": str(name), "odds": odd})
+    normalized = []
+    for market in markets:
+        mid = pick(market, "id", "marketId", "MarketId", "marketID", "ID")
+        eid = pick(market, "eventId", "EventId", "eventID", "parentEventId")
+        event_name = event_by_id.get(str(eid))
+        market_name = pick(market, "name", "marketName", "MarketName", "caption", "Caption", "description", "Description")
+        vals = outcomes_by_market.get(str(mid), [])
+        if event_name and market_name and len({normalize_text(x["name"]) for x in vals}) == 2:
+            normalized.append({"sport": "Football", "event": event_name, "market": str(market_name), "outcomes": vals, "updated_at": pick(market, "updatedAt", "updated_at", "lastUpdate")})
+    return normalized, len(events), "Betway flat-array schema recognized"
+
+
+def adapt_1xbet_payload(payload):
+    """Recognize 1xBet LineFeed fixture payloads without inventing unsupported odds."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("Value"), list):
+        return None, 0, 'Valid JSON, but expected 1xBet LineFeed "Value" array'
+    events = payload.get("Value", [])
+    normalized = []
+    for item in events:
+        if not isinstance(item, dict):
+            continue
+        # Only accept explicit market/outcome collections; fixture-level labels are not prices.
+        markets = item.get("markets") or item.get("Markets") or item.get("E")
+        if not isinstance(markets, list):
+            continue
+        home = first_value(item, ["O1", "home", "homeTeam", "HomeTeam"])
+        away = first_value(item, ["O2", "away", "awayTeam", "AwayTeam"])
+        if not home or not away:
+            continue
+        for market in markets:
+            if not isinstance(market, dict):
+                continue
+            name = first_value(market, ["name", "N", "marketName", "caption"])
+            raw_outcomes = market.get("outcomes") or market.get("Outcomes") or market.get("values")
+            if not isinstance(raw_outcomes, list):
+                continue
+            outs = []
+            for out in raw_outcomes:
+                if isinstance(out, dict):
+                    oname = first_value(out, ["name", "N", "label", "caption"])
+                    odd = finite_number(first_value(out, ["odds", "C", "price", "value"]), minimum=1.000001)
+                    if oname and odd is not None:
+                        outs.append({"name": str(oname), "odds": odd})
+            if name and len({normalize_text(o["name"]) for o in outs}) == 2:
+                normalized.append({"sport": "Football", "event": f"{home} vs {away}", "market": str(name), "outcomes": outs, "updated_at": first_value(market, ["updatedAt", "updated_at"])})
+    if normalized:
+        return normalized, len(events), "1xBet explicit market/outcome schema recognized"
+    return [], len(events), "1xBet fixtures were returned, but no supported explicit two-outcome market/odds objects were found; no odds inferred"
+
+
+def fetch_all_feeds():
+    """Fetch feeds, use source-specific adapters, and retain per-source diagnostics."""
+    rows, health = [], []
+    for key, config in BOOKMAKERS.items():
+        request_url, headers = prepare_feed_request(key, config["feed_url"])
+        if key == "bet9ja":
+            raw_events, diag = fetch_bet9ja_xml(request_url, headers)
+            if diag.get("schema_valid") and raw_events:
+                for raw in raw_events:
+                    row = normalize_feed_event(key, raw)
+                    if row:
+                        rows.append(row)
+                # Adapter already counts the XML records; normalized count must match rows accepted.
+                diag["events_loaded"] = sum(1 for r in rows if r["bookmaker_key"] == key)
+                diag["events_rejected"] = max(0, diag.get("raw_events", 0) - diag["events_loaded"])
+            health.append(diag)
+            continue
+
+        payload, diag = safe_fetch_json(request_url, config["name"], headers)
+        diag["bookmaker"] = config["name"]
+        if payload is None:
+            health.append(diag)
+            continue
+
+        if key == "sportybet":
+            raw_events, raw_count, adapter_detail = adapt_sportybet_payload(payload)
+        elif key == "betway":
+            raw_events, raw_count, adapter_detail = adapt_betway_payload(payload)
+        elif key == "1xbet":
+            raw_events, raw_count, adapter_detail = adapt_1xbet_payload(payload)
+        else:
+            raw_events, raw_count, adapter_detail = payload.get("events"), 0, "Generic events schema"
+            if isinstance(raw_events, list):
+                raw_count = len(raw_events)
+        if raw_events is None:
+            diag.update(status="invalid schema", schema_valid=False, detail=adapter_detail)
+            health.append(diag)
+            continue
+        if not isinstance(raw_events, list):
+            diag.update(status="invalid schema", schema_valid=False, detail="Adapter returned an unsupported data structure")
+            health.append(diag)
+            continue
+        diag["schema_valid"] = True
+        diag["raw_events"] = raw_count
+        diag["adapter_detail"] = adapter_detail
+        diag["last_successful_fetch"] = diag.get("last_successful_fetch") or now_iso()
+        if not raw_events:
+            diag.update(status="no usable markets", detail=adapter_detail)
+            health.append(diag)
+            continue
+
+        rejection_reasons = {}
+        newest_timestamp = None
+        for raw in raw_events:
+            row = normalize_feed_event(key, raw)
+            if row:
+                rows.append(row)
+                diag["events_loaded"] += 1
+                stamp = parse_timestamp(row.get("updated_at"))
+                if stamp and (newest_timestamp is None or stamp > newest_timestamp):
+                    newest_timestamp = stamp
+            else:
+                diag["events_rejected"] += 1
+                reason = "not an object" if not isinstance(raw, dict) else "missing event/market/outcomes, invalid odds, or not exactly two unique outcomes"
+                rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
+        diag["rejection_reasons"] = rejection_reasons
+        if newest_timestamp:
+            age = max(0, int((datetime.now(timezone.utc) - newest_timestamp).total_seconds()))
+            diag["data_updated_at"] = newest_timestamp.isoformat()
+            diag["freshness_seconds"] = age
+            diag["stale"] = age > STALE_AFTER_SECONDS
+        else:
+            diag["stale"] = None
+        if diag["events_loaded"] == 0:
+            diag.update(status="no usable markets", detail=adapter_detail)
+        elif diag["stale"] is True:
+            diag.update(status="stale data", detail=f"Usable markets found, but newest event timestamp exceeds {STALE_AFTER_SECONDS}s or may be old")
+        elif newest_timestamp is None:
+            diag.update(status="usable markets; freshness unknown", detail="Usable markets found; source did not provide a parseable odds-update timestamp")
+        else:
+            diag.update(status="usable markets", detail="Source schema recognized and usable two-outcome markets parsed; source authenticity and odds accuracy are not independently verified")
+        health.append(diag)
+    return rows, health
+
+
+def find_arbitrage(rows):
+    """Find theoretical two-outcome arbitrage using distinct bookmakers per leg.
+
+    A market is eligible only when every participating quote contains the same
+    two normalized outcomes. Each outcome pair is checked across bookmaker
+    quotes; we do not select a best price first and accidentally hide valid
+    cross-bookmaker combinations.
+    """
+    groups = {}
+    for row in rows:
+        key = (row["sport"].lower(), row["event_key"], row["market_key"])
+        groups.setdefault(key, []).append(row)
+
+    opportunities = []
+    seen = set()
+    for _, market_rows in groups.items():
+        outcome_sets = [
+            {outcome["name_key"] for outcome in row["outcomes"]}
+            for row in market_rows
+        ]
+        if not outcome_sets:
+            continue
+        outcome_names = set().union(*outcome_sets)
+        if len(outcome_names) != 2 or any(names != outcome_names for names in outcome_sets):
+            continue
+
+        quotes_by_outcome = {name: [] for name in outcome_names}
+        for row in market_rows:
+            for outcome in row["outcomes"]:
+                quotes_by_outcome[outcome["name_key"]].append({
+                    "bookmaker": row["bookmaker"],
+                    "bookmaker_key": row["bookmaker_key"],
+                    "odds": outcome["odds"],
+                    "selection": outcome["name"],
+                })
+
+        outcome_a, outcome_b = sorted(outcome_names)
+        for quote_a in quotes_by_outcome[outcome_a]:
+            for quote_b in quotes_by_outcome[outcome_b]:
+                if quote_a["bookmaker_key"] == quote_b["bookmaker_key"]:
+                    continue
+                probability_sum = (1.0 / quote_a["odds"]) + (1.0 / quote_b["odds"])
+                if probability_sum >= 1.0:
+                    continue
+                identity = (
+                    market_rows[0]["sport"], market_rows[0]["event_key"],
+                    market_rows[0]["market_key"], outcome_a,
+                    quote_a["bookmaker_key"], quote_a["odds"],
+                    quote_b["bookmaker_key"], quote_b["odds"],
+                )
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                legs = []
+                for quote in (quote_a, quote_b):
+                    leg = dict(quote)
+                    leg["stake_fraction"] = (1.0 / leg["odds"]) / probability_sum
+                    legs.append(leg)
+                opportunities.append({
+                    "sport": market_rows[0]["sport"],
+                    "event": market_rows[0]["event"],
+                    "market": market_rows[0]["market"],
+                    "implied_probability_sum": probability_sum * 100.0,
+                    "theoretical_margin_percent": (1.0 - probability_sum) * 100.0,
+                    "legs": legs,
+                    "warning": (
+                        "Theoretical only. Confirm the exact event, market, line, "
+                        "settlement rules, odds freshness, limits, fees, and that "
+                        "both outcomes are exhaustive and mutually exclusive."
+                    ),
+                })
+
+    opportunities.sort(key=lambda item: item["theoretical_margin_percent"], reverse=True)
+    return opportunities
+
+
+PRIORITY_MARKETS = (
+    "over", "under", "total goals", "total points",
+    "double chance", "corners", "corner",
+)
+
+
+def is_priority_market(market):
+    normalized = normalize_text(market)
+    return any(term in normalized for term in PRIORITY_MARKETS)
+
+
+def filter_probabilities(rows, threshold=MIN_PROBABILITY):
+    eligible = []
+    for row in rows:
+        priority = is_priority_market(row["market"])
+        for outcome in row["outcomes"]:
+            probability = outcome.get("estimated_probability")
+            if probability is None or probability < threshold:
+                continue
+            eligible.append({
+                "sport": row["sport"], "event": row["event"],
+                "market": row["market"], "selection": outcome["name"],
+                "bookmaker": row["bookmaker"], "odds": outcome["odds"],
+                "estimated_probability": probability, "threshold": threshold,
+                "priority_market": priority,
+                "evidence": (
+                    "Estimate supplied by configured feed; not independently "
+                    "validated by SolveEase."
+                ),
+            })
+    eligible.sort(
+        key=lambda item: (item["priority_market"], item["estimated_probability"]),
+        reverse=True,
+    )
+    return eligible
+
+
+def alternative_markets(rows, threshold=MIN_PROBABILITY):
+    suggestions = {}
+    for row in rows:
+        if not is_priority_market(row["market"]):
+            continue
+        for outcome in row["outcomes"]:
+            probability = outcome.get("estimated_probability")
+            if probability is None or probability < threshold:
+                continue
+            key = (row["sport"].lower(), row["event_key"])
+            suggestions.setdefault(key, []).append({
+                "sport": row["sport"], "event": row["event"],
+                "market": row["market"], "selection": outcome["name"],
+                "bookmaker": row["bookmaker"], "odds": outcome["odds"],
+                "estimated_probability": probability,
+                "note": (
+                    "Candidate only. Confirm exact line, market rules, and "
+                    "source freshness before considering use."
+                ),
+            })
+
+    result = []
+    for items in suggestions.values():
+        items.sort(key=lambda item: item["estimated_probability"], reverse=True)
+        result.extend(items)
+    return result
+
+
+def run_scan():
+    rows, health = fetch_all_feeds()
+    arbitrage = find_arbitrage(rows)
+    probabilities = filter_probabilities(rows)
+    alternatives = alternative_markets(rows)
+    result = {
+        "ok": True,
+        "scanned_at": now_iso(),
+        "bookmakers": health,
+        "usable_two_outcome_markets": len(rows),
+        "arbitrage_count": len(arbitrage),
+        "arbitrage": arbitrage,
+        "probability_filter_threshold": MIN_PROBABILITY,
+        "qualified_selections_count": len(probabilities),
+        "qualified_selections": probabilities,
+        "alternative_markets_count": len(alternatives),
+        "alternative_markets": alternatives,
+        "notes": [
+            "No opportunity is displayed unless configured feed data qualifies.",
+            "A feed-provided probability estimate is not a guarantee.",
+            "Both outcomes must be exhaustive and use identical settlement rules.",
+            "Unavailable feeds do not count as a negative arbitrage result.",
+        ],
     }
-    picks.push({event:`Selection ${i+1}`,selection:`Selection ${i+1}`,odds});
-  }
-  try {
-    const result=await api("/api/analyse",{method:"POST",body:JSON.stringify({picks})});
-    $("calculation-result").innerHTML=`<div class="muted">Combined decimal odds</div><div class="result-big">${safe(result.combined_decimal_odds)}</div><div>Break-even probability: <strong>${safe(result.break_even_probability_percent)}%</strong></div><p class="muted">${safe(result.warning)}</p>`;
-  } catch(e){$("calculation-result").textContent="Calculation failed: "+e.message;}
-});
+    global LAST_SCAN, LAST_FEED_STATUS
+    with STATE_LOCK:
+        LAST_FEED_STATUS = [dict(item) for item in health]
+        LAST_SCAN = {
+            "at": result["scanned_at"],
+            "feeds_with_usable_markets": sum(1 for item in health if item["events_loaded"] > 0),
+            "configured_feeds": sum(1 for config in BOOKMAKERS.values() if config["feed_url"]),
+            "markets": len(rows),
+            "opportunities": len(arbitrage),
+        }
+    logging.info(
+        "Scan completed: feeds=%s markets=%s opportunities=%s",
+        len(health), len(rows), len(arbitrage),
+    )
+    return result
 
-async function loadHistory(){
-  if(!$("history-list")) return;
-  try {
-    const result=await api("/api/history?limit=50");
-    const rows=result.runs||[];
-    $("history-list").innerHTML=rows.length?`<table><thead><tr><th>Started</th><th>Status</th><th>Feeds</th><th>Quotes</th><th>Candidates</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${safe(r.started_at)}</td><td>${safe(r.status)}</td><td>${safe(r.feeds_reached)}/${safe(r.feed_count)}</td><td>${safe(r.quote_count)}</td><td>${safe(r.candidate_count)}</td></tr>`).join("")}</tbody></table>`:"<p class='muted'>No scan history recorded yet.</p>";
-  } catch(e){$("history-list").textContent="Unable to load history: "+e.message;}
-}
-if($("refresh-history")) $("refresh-history").addEventListener("click",loadHistory);
 
-async function loadDataHealth(){
-  if(!$("health-json")) return;
-  try {$("health-json").textContent=pretty(await api("/api/data-health"));}
-  catch(e){$("health-json").textContent="Unable to load data health: "+e.message;}
-}
-if($("refresh-health")) $("refresh-health").addEventListener("click",loadDataHealth);
+# ---------------------------------------------------------------------
+# Dashboard HTML
+# ---------------------------------------------------------------------
 
-refreshOverview();
-if($("run-scan")\vert{}\vert{}$("feed-list")) loadScanner();
-if($("history-list")) loadHistory();
-if($("health-json")) loadDataHealth();
-
-if("serviceWorker" in navigator) {
-  window.addEventListener("load",()=>navigator.serviceWorker.register("/sw.js").catch(()=>{}));
-}
-"""
-
-    return f"""<!doctype html>
+HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#08111f">
-<meta name="description" content="Read-only football market research and odds analysis.">
-<link rel="manifest" href="/manifest.webmanifest">
-<link rel="icon" href="/icon.svg" type="image/svg+xml">
-<title>{escape(title)} · {APP_NAME}</title>
-<style>{CSS}</style>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#101827">
+<meta name="description" content="SolveEase bookmaker lookup, ticket reconstruction and arbitrage dashboard">
+<title>SolveEase | Booking & Arbitrage Dashboard</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1220;--panel:#121d30;--panel2:#18263c;--text:#eef4ff;--muted:#9eb0ca;--line:#2b3b54;--accent:#69d7ac;--danger:#ff8585;--warning:#ffd479}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,sans-serif}
+main{width:min(1060px,100%);margin:auto;padding:20px 14px 44px}
+header{margin:8px 0 20px}.brand{color:var(--accent);font-weight:850;letter-spacing:.8px;font-size:13px}
+h1{font-size:clamp(27px,5vw,40px);line-height:1.15;margin:8px 0}
+h2{font-size:21px;margin:0 0 10px}h3{font-size:16px;margin:0 0 6px}
+p{color:var(--muted)}.panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:17px;margin:14px 0}
+label{display:block;font-weight:650;margin:10px 0 6px}
+input,select{width:100%;min-height:48px;padding:12px;border-radius:10px;border:1px solid var(--line);background:#09101d;color:var(--text);font-size:16px}
+button{min-height:48px;padding:12px 16px;border:0;border-radius:10px;background:var(--accent);color:#071b15;font-weight:800;font-size:15px;cursor:pointer}
+button:disabled{opacity:.55;cursor:wait}
+.actions{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:9px;margin-top:12px}
+.secondary{background:var(--panel2);color:var(--text);border:1px solid var(--line)}
+.small{font-size:13px;color:var(--muted)}.error{color:var(--danger)}.success{color:var(--accent)}.warning{color:var(--warning)}
+.hidden{display:none}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}
+.stat{padding:12px;background:var(--panel2);border-radius:10px;min-width:0}
+.stat span{display:block;font-size:12px;color:var(--muted)}.stat strong{display:block;font-size:20px;overflow-wrap:anywhere}
+.item{background:var(--panel2);border:1px solid var(--line);border-radius:11px;padding:13px;margin:9px 0}
+.item p{margin:5px 0;overflow-wrap:anywhere}.pill{display:inline-block;border:1px solid var(--line);border-radius:20px;padding:3px 9px;margin:3px 4px 3px 0;font-size:12px}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}
+.notice{border-left:3px solid var(--warning);padding-left:11px}
+footer{font-size:12px;color:var(--muted);margin-top:24px}
+@media(min-width:760px){.two-col{display:grid;grid-template-columns:1fr 1fr;gap:14px}.two-col .panel{margin:0}}
+</style>
 </head>
 <body>
-<header class="topbar"><div class="topinner">
-<a class="brand" href="/"><span class="logo">∑</span><span>SolveEase<small>SUREBET INTELLIGENCE · V{VERSION}</small></span></a>
-<span class="top-status"><span class="dot"></span>READ-ONLY SYSTEM</span>
-</div></header>
-<div class="layout">
-<nav class="sidebar" aria-label="Main navigation">{''.join(nav)}</nav>
-<main class="content">{content}</main>
-</div>
-<footer>Read-only research tool. No bets are placed. Prices may be delayed, unavailable, incomplete or incorrect. Always independently verify market availability, settlement rules and timestamps. No profit is guaranteed.</footer>
-<script>{js}</script>
+<main>
+<header>
+  <div class="brand">SOLVEEASE · BOOKING TOOLS</div>
+  <h1>Booking & Arbitrage Dashboard</h1>
+  <p>Read-only ticket lookup, manual ticket reconstruction, odds comparison and probability filters.</p>
+</header>
+
+<section class="panel" id="lookupPanel">
+  <h2>1. Booking-code lookup</h2>
+  <p>Enter a code and the dashboard will verify it using the lookup adapters currently available.</p>
+  <label for="code">Booking code</label>
+  <input id="code" maxlength="120" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Enter booking code">
+  <div class="actions">
+    <button id="lookupBtn" onclick="lookup()">Identify & look up</button>
+    <button class="secondary" onclick="clearLookup()">Clear ticket</button>
+  </div>
+  <p class="small">Currently supported: SportyBet read-only lookup. Bet9ja and BetKing are not confirmed from code format alone and do not yet have lookup adapters.</p>
+  <div id="lookupMessage" role="status" aria-live="polite"></div>
+  <div id="ticketResult"></div>
+</section>
+
+<section class="panel" id="converterPanel">
+  <h2>2. Bookmaker ticket converter</h2>
+  <p>Prepare a copyable checklist from a successfully retrieved ticket for manual recreation at another bookmaker.</p>
+  <label for="destinationBookmaker">Destination bookmaker</label>
+  <select id="destinationBookmaker">
+    <option value="sportybet">SportyBet</option>
+    <option value="bet9ja">Bet9ja</option>
+    <option value="betking">BetKing</option>
+  </select>
+  <div class="actions">
+    <button id="prepareBtn" onclick="prepareConversion()">Prepare ticket</button>
+    <button id="copyBtn" class="secondary" onclick="copyConvertedTicket()">Copy prepared ticket</button>
+  </div>
+  <div id="converterMessage" role="status" aria-live="polite"></div>
+  <div id="converterSummary" class="grid"></div>
+  <pre id="convertedTicket" class="item">Look up a supported booking code first.</pre>
+  <p class="small notice">Manual reconstruction only. This does not generate a destination booking code or prove that equivalent markets are available. Verify each event, market, selection, line and current price yourself.</p>
+</section>
+
+<section class="panel" id="scannerPanel">
+  <h2>3. Arbitrage scanner</h2>
+  <p>Scans only the permitted JSON odds feeds configured on the server. Missing feeds are reported as unavailable, not as proof that no opportunity exists.</p>
+  <div class="actions">
+    <button id="scanBtn" onclick="scan()">Scan bookmakers now</button>
+    <button class="secondary" onclick="loadHealth()">Refresh service status</button>
+  </div>
+  <div id="scanMessage" role="status" aria-live="polite"></div>
+  <div id="sourceHealth"></div>
+  <div id="scanSummary" class="grid"></div>
+  <h3>Arbitrage opportunities</h3><div id="arbitrage"></div>
+  <h3>Probability filter</h3>
+  <p class="small">Default threshold: 60%. Uses estimates supplied by the configured feed, not odds-implied probabilities.</p>
+  <div id="probabilities"></div>
+  <h3>Preferred alternative markets</h3>
+  <p class="small">Priorities include Over/Under, Double Chance and Corners where supported by feed data.</p>
+  <div id="alternatives"></div>
+</section>
+
+<section class="panel">
+  <h2>Service status</h2>
+  <div id="health">Checking service…</div>
+  <p class="small">Read-only tools. No automatic bet placement and no bookmaker login credentials requested. Odds and availability can change rapidly.</p>
+</section>
+<footer>SolveEase · Mobile-friendly · Manual confirmation required · No automatic bet placement</footer>
+</main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+let lastLookupData = null;
+let preparedTicketText = "";
+
+function el(tag, text, parent, cls) {
+  const node = document.createElement(tag);
+  node.textContent = String(text ?? "");
+  if (cls) node.className = cls;
+  parent.appendChild(node);
+  return node;
+}
+function clear(id) { $(id).replaceChildren(); }
+function money(value, digits=2) {
+  if (value === null || value === undefined || value === "" || !Number.isFinite(Number(value))) return "Unavailable";
+  return Number(value).toLocaleString("en-US", {minimumFractionDigits:digits,maximumFractionDigits:digits});
+}
+async function api(path, method="GET", body=null) {
+  const options = {method, headers:{}};
+  if (body !== null) {
+    options.headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(body);
+  }
+  const response = await fetch(path, options);
+  let data;
+  try { data = await response.json(); }
+  catch (_) { throw new Error("Server returned an unreadable response."); }
+  if (!response.ok || data.ok === false) throw new Error(data.error || "Request failed.");
+  return data;
+}
+
+function clearLookup() {
+  lastLookupData = null;
+  preparedTicketText = "";
+  $("code").value = "";
+  $("lookupMessage").textContent = "";
+  $("lookupMessage").className = "";
+  clear("ticketResult");
+  clear("converterSummary");
+  $("converterMessage").textContent = "";
+  $("converterMessage").className = "";
+  $("convertedTicket").textContent = "Look up a supported booking code first.";
+}
+
+async function lookup() {
+  const code = $("code").value.trim();
+  if (!code) {
+    $("lookupMessage").textContent = "Enter a booking code.";
+    $("lookupMessage").className = "warning";
+    return;
+  }
+  lastLookupData = null;
+  preparedTicketText = "";
+  clear("ticketResult");
+  clear("converterSummary");
+  $("convertedTicket").textContent = "Look up a supported booking code first.";
+  $("converterMessage").textContent = "";
+  $("lookupBtn").disabled = true;
+  $("lookupMessage").textContent = "Checking supported lookup sources…";
+  $("lookupMessage").className = "";
+
+  try {
+    const data = await api("/api/lookup", "POST", {code, bookmaker:"auto"});
+    lastLookupData = data;
+    $("lookupMessage").textContent = "Lookup completed and source confirmed.";
+    $("lookupMessage").className = "success";
+    const box = $("ticketResult");
+    const title = el("div", "", box, "item");
+    el("h3", "Verified source: " + data.bookmaker, title);
+    el("p", data.bookmaker_identification || "Confirmed by successful lookup.", title, "small");
+
+    const stats = el("div", "", box, "grid");
+    [
+      ["Selections displayed", data.displayed_selections_count],
+      ["Source selection count", data.source_selection_count],
+      ["Source combined odds", money(data.source_combined_odds)],
+      ["Calculated odds", money(data.calculated_combined_odds)],
+      ["Odds agree", data.odds_agree === null ? "Cannot verify" : (data.odds_agree ? "Yes" : "No")],
+      ["Ticket status", data.status],
+      ["Stake", data.stake == null ? "Not provided" : String(data.stake) + " (units unverified)"],
+      ["Potential return", data.potential_return == null ? "Not provided" : String(data.potential_return) + " (units unverified)"]
+    ].forEach(([label,value]) => {
+      const stat = el("div", "", stats, "stat");
+      el("span", label, stat);
+      el("strong", value ?? "Not provided", stat);
+    });
+
+    if (data.odds_agree === false) {
+      el("p", "Warning: source odds and calculated odds differ. At least one selection or odds value may be missing or interpreted differently. Review every leg.", box, "warning");
+    }
+    if (data.source_selection_count !== data.displayed_selections_count) {
+      el("p", "Warning: source selection count differs from the displayed outcome count.", box, "warning");
+    }
+
+    el("h3", "Ticket selections", box);
+    (data.legs || []).forEach(leg => {
+      const card = el("div", "", box, "item");
+      el("strong", String(leg.number) + ". " + (leg.event || "Event unavailable"), card);
+      el("p", "Market: " + (leg.market || "Needs verification"), card);
+      el("p", "Selection: " + (leg.selection || "Needs verification"), card);
+      el("p", "Source odds: " + (leg.odds_verified ? money(leg.odds, 3) : "Unverified"), card);
+      if (leg.kickoff) el("p", "Kickoff/source time: " + leg.kickoff, card, "small");
+    });
+    el("p", data.note || "Verify details at the source bookmaker.", box, "small");
+  } catch (err) {
+    $("lookupMessage").textContent = err.message;
+    $("lookupMessage").className = "error";
+  } finally {
+    $("lookupBtn").disabled = false;
+  }
+}
+
+function prepareConversion() {
+  const data = lastLookupData;
+  const destination = $("destinationBookmaker").value;
+  const names = {sportybet:"SportyBet",bet9ja:"Bet9ja",betking:"BetKing"};
+  const message = $("converterMessage");
+  const output = $("convertedTicket");
+  clear("converterSummary");
+  preparedTicketText = "";
+
+  if (!data || data.ok !== true || !Array.isArray(data.legs) || !data.legs.length) {
+    message.textContent = "Look up a supported booking code successfully first.";
+    message.className = "warning";
+    output.textContent = "No ticket available to reconstruct.";
+    return;
+  }
+
+  const destinationName = names[destination] || "Selected bookmaker";
+  const sameSource = String(data.bookmaker_key || "").toLowerCase() === destination;
+  let needsVerification = 0;
+  const lines = [
+    "SOLVEEASE — MANUAL TICKET RECONSTRUCTION",
+    "Source bookmaker: " + (data.bookmaker || "Unknown"),
+    "Destination bookmaker: " + destinationName,
+    "Source ticket retrieved: " + (data.retrieved_at || "Time unavailable"),
+    "Displayed selections: " + data.legs.length,
+    "",
+    "STATUS: NOT A DESTINATION BOOKING CODE",
+    "This checklist has not been matched against the destination's live markets.",
+    ""
+  ];
+
+  data.legs.forEach((leg, index) => {
+    const hasOdds = leg.odds_verified === true && Number.isFinite(Number(leg.odds));
+    const event = String(leg.event || "Event unavailable");
+    const market = String(leg.market || "Market needs verification");
+    const selection = String(leg.selection || "Selection needs verification");
+    const ambiguous = !hasOdds ||
+      /needs verification|unavailable|not identifiable/i.test(market + " " + selection + " " + event);
+    if (ambiguous) needsVerification++;
+
+    lines.push(
+      (index + 1) + ". " + event,
+      "   Market: " + market,
+      "   Selection: " + selection,
+      "   Source odds: " + (hasOdds ? Number(leg.odds).toFixed(3) : "Unverified"),
+      "   Destination match: " + (ambiguous ? "REQUIRES MANUAL IDENTIFICATION" : "NOT YET VERIFIED"),
+      "   Current destination odds: Check directly with bookmaker",
+      ""
+    );
+  });
+
+  lines.push(
+    "Before recreating: confirm event identity, kickoff, market name, handicap/total line,",
+    "selection wording, settlement rules, current odds, and ticket acceptance.",
+    "No destination code has been requested or generated."
+  );
+  preparedTicketText = lines.join("\n");
+  output.textContent = preparedTicketText;
+
+  const cards = [
+    ["Selections to review", data.legs.length],
+    ["Legs with ambiguous source details", needsVerification],
+    ["Destination matching", "Not verified"]
+  ];
+  cards.forEach(([label,value]) => {
+    const card = el("div", "", $("converterSummary"), "stat");
+    el("span", label, card);
+    el("strong", value, card);
+  });
+
+  message.textContent = sameSource
+    ? "Prepared source-ticket checklist. Recreating at the same bookmaker still requires checking current markets and odds."
+    : "Manual reconstruction checklist prepared for " + destinationName + ". Destination equivalence is not verified.";
+  message.className = "warning";
+}
+
+async function copyConvertedTicket() {
+  const message = $("converterMessage");
+  if (!preparedTicketText) {
+    message.textContent = "Prepare a ticket before copying.";
+    message.className = "warning";
+    return;
+  }
+  try {
+    if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error("Clipboard unavailable");
+    await navigator.clipboard.writeText(preparedTicketText);
+    message.textContent = "Prepared ticket copied to clipboard.";
+    message.className = "success";
+  } catch (_) {
+    message.textContent = "Automatic copy is unavailable in this browser. Long-press the text, select it, and copy manually.";
+    message.className = "warning";
+  }
+}
+
+function renderList(targetId, items, renderer, emptyText) {
+  clear(targetId);
+  if (!items || !items.length) {
+    el("p", emptyText, $(targetId), "small");
+    return;
+  }
+  items.forEach(item => renderer(item, $(targetId)));
+}
+
+function renderHealth(items) {
+  renderList("sourceHealth", items, (item,parent) => {
+    const card = el("div", "", parent, "item");
+    el("strong", item.bookmaker + " — " + item.status, card);
+    el("p", item.detail || "No diagnostic detail available.", card, "small");
+    const parts = [
+      "HTTP: " + (item.http_status ?? "not reached"),
+      "Content-Type: " + (item.content_type || "unknown"),
+      "Response: " + (item.response_bytes ?? 0) + " bytes",
+      "Fetch: " + (item.fetch_ms ?? 0) + " ms",
+      "JSON: " + (item.json_valid ? "valid" : "no/invalid"),
+      "Schema: " + (item.schema_valid ? "recognized" : "not confirmed"),
+      "Events: " + (item.raw_events ?? 0) + " received / " + (item.events_loaded ?? 0) + " usable / " + (item.events_rejected ?? 0) + " rejected"
+    ];
+    el("p", parts.join(" · "), card, "small");
+    if (item.last_successful_fetch) el("p", "Last successful JSON fetch: " + item.last_successful_fetch, card, "small");
+    if (item.data_updated_at) el("p", "Newest event timestamp: " + item.data_updated_at + " · age " + item.freshness_seconds + " seconds" + (item.stale ? " · STALE" : ""), card, item.stale ? "warning" : "small");
+    else el("p", "Data freshness: unknown (no usable updated_at timestamp)", card, "small");
+    const reasons = item.rejection_reasons || {};
+    const reasonText = Object.entries(reasons).map(([reason,count]) => reason + ": " + count).join("; ");
+    if (reasonText) el("p", "Rejected-event reasons: " + reasonText, card, "small");
+  }, "No source health data.");
+}
+
+async function scan() {
+  $("scanBtn").disabled = true;
+  $("scanMessage").textContent = "Fetching configured odds feeds…";
+  $("scanMessage").className = "";
+  ["sourceHealth","scanSummary","arbitrage","probabilities","alternatives"].forEach(clear);
+  try {
+    const data = await api("/api/scan", "POST", {});
+    $("scanMessage").textContent = "Scan completed at " + data.scanned_at;
+    renderHealth(data.bookmakers);
+    const summary = $("scanSummary");
+    [
+      ["Usable two-outcome markets",data.usable_two_outcome_markets],
+      ["Arbitrage opportunities",data.arbitrage_count],
+      ["Selections at/above threshold",data.qualified_selections_count],
+      ["Alternative candidates",data.alternative_markets_count]
+    ].forEach(([label,value]) => {
+      const stat = el("div", "", summary, "stat");
+      el("span", label, stat);
+      el("strong", value, stat);
+    });
+
+    renderList("arbitrage", data.arbitrage, (item,parent) => {
+      const card = el("div", "", parent, "item");
+      el("h3", item.event + " · " + item.sport, card);
+      el("p", "Market: " + item.market, card);
+      el("p", "Theoretical margin: " + money(item.theoretical_margin_percent) + "%", card, "success");
+      el("p", "Implied probability sum: " + money(item.implied_probability_sum) + "%", card);
+      item.legs.forEach(leg => el("p",
+        leg.selection + ": " + leg.bookmaker + " @ " + money(leg.odds) +
+        " · suggested stake share " + money(leg.stake_fraction * 100) + "%",
+        card));
+      el("p", item.warning, card, "small");
+    }, "No qualifying arbitrage opportunity found in currently available feeds. Unavailable feeds are not proof that no arbitrage exists.");
+
+    renderList("probabilities", data.qualified_selections, (item,parent) => {
+      const card = el("div", "", parent, "item");
+      el("strong", item.event, card);
+      el("p", item.market + " · " + item.selection, card);
+      el("p", item.bookmaker + " @ " + money(item.odds), card);
+      el("p", "Feed-estimated probability: " + money(item.estimated_probability * 100) + "%", card);
+      el("p", item.evidence, card, "small");
+    }, "No feed-provided estimates reached the configured probability threshold. Odds alone are not treated as a model prediction.");
+
+    renderList("alternatives", data.alternative_markets, (item,parent) => {
+      const card = el("div", "", parent, "item");
+      el("strong", item.event, card);
+      el("p", item.market + " · " + item.selection, card);
+      el("p", item.bookmaker + " @ " + money(item.odds), card);
+      el("p", "Feed-estimated probability: " + money(item.estimated_probability * 100) + "%", card);
+      el("p", item.note, card, "small");
+    }, "No qualifying Over/Under, Double Chance, or Corners alternatives are available from configured feeds.");
+  } catch (err) {
+    $("scanMessage").textContent = err.message;
+    $("scanMessage").className = "error";
+  } finally {
+    $("scanBtn").disabled = false;
+  }
+}
+
+async function loadHealth() {
+  try {
+    const data = await api("/health");
+    $("health").textContent =
+      "Service online · " + data.configured_feeds +
+      " configured odds feeds · SportyBet lookup adapter available";
+    if (data.feed_status) renderHealth(data.feed_status);
+  } catch (_) {
+    $("health").textContent = "Could not check service status.";
+  }
+}
+
+$("code").addEventListener("keydown", event => {
+  if (event.key === "Enter") lookup();
+});
+loadHealth();
+</script>
 </body>
 </html>"""
 
 
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------
 # HTTP server
-# ------------------------------------------------------------
-
-def client_key(handler):
-    # Behind a proxy, do not blindly trust arbitrary X-Forwarded-For.
-    # Remote address is used to avoid spoofable headers.
-    return handler.client_address[0] if handler.client_address else "unknown"
-
-
-def rate_limited(handler):
-    method = handler.command
-    limit, window = RATE_LIMITS.get(method, (60, 60))
-    key = (client_key(handler), method)
-    now = time.time()
-
-    with RATE_LOCK:
-        recent = [stamp for stamp in REQUEST_TIMES[key] if now - stamp < window]
-        if len(recent) >= limit:
-            REQUEST_TIMES[key] = recent
-            return True
-        recent.append(now)
-        REQUEST_TIMES[key] = recent
-
-        # Avoid unbounded growth of old keys.
-        if len(REQUEST_TIMES) > 5000:
-            for old_key in list(REQUEST_TIMES.keys())[:1000]:
-                REQUEST_TIMES.pop(old_key, None)
-
-    return False
-
+# ---------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SolveEaseHTTP/7.0"
-    sys_version = ""
+    server_version = "SolveEase/3.4"
 
     def log_message(self, fmt, *args):
-        # Never log query strings or request bodies, which could contain
-        # share codes or other user-supplied values.
-        path = urlparse(self.path).path
-        log.info("%s %s %s", self.client_address[0], self.command, path)
+        # Avoid logging query strings, POST bodies, and booking codes.
+        safe_message = fmt.split('"')[0].strip()
+        logging.info("%s - %s", self.address_string(), safe_message)
 
-    def send_bytes(self, status, body, content_type="application/json; charset=utf-8",
-                   extra_headers=None):
+    def send_bytes(self, status, body, content_type):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-        self.send_header("Cache-Control", "no-store")
-        if extra_headers:
-            for key, value in extra_headers.items():
-                self.send_header(key, value)
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                         "img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'")
         self.end_headers()
         if self.command != "HEAD":
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
     def send_json(self, status, data):
-        self.send_bytes(status, json_bytes(data))
+        body = json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        self.send_bytes(status, body, "application/json; charset=utf-8")
 
-    def send_error_json(self, status, message):
-        self.send_json(status, {"error": clean_string(message, 300)})
-
-    def read_json_body(self):
-        raw_length = self.headers.get("Content-Length", "0")
+    def read_body(self):
         try:
-            length = int(raw_length)
+            length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            raise ValueError("Invalid Content-Length.")
-
-        if length < 0 or length > MAX_REQUEST_BYTES:
-            raise ValueError("Request body is too large.")
-
-        body = self.rfile.read(length) if length else b"{}"
+            raise ValueError("Invalid request length")
+        if length < 1 or length > 16384:
+            raise ValueError("Request body is empty or too large")
         try:
-            return json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError("Request body must be valid JSON.") from exc
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError("Request body must be valid JSON")
 
     def do_HEAD(self):
-        self.do_GET()
+        path = urlsplit(self.path).path
+        if path == "/":
+            self.send_bytes(200, HTML.encode("utf-8"), "text/html; charset=utf-8")
+        else:
+            self.send_json(200, {"status": "online"})
 
     def do_GET(self):
-        if rate_limited(self):
-            self.send_error_json(429, "Too many requests. Please try again shortly.")
+        path = urlsplit(self.path).path.rstrip("/") or "/"
+        if path == "/":
+            self.send_bytes(200, HTML.encode("utf-8"), "text/html; charset=utf-8")
             return
-
-        parsed = urlparse(self.path)
-        path = parsed.path.rstrip("/") or "/"
-        query = parse_qs(parsed.query)
-
-        if path in ("/health", "/healthz"):
-            self.send_json(200, health_payload())
+        if path == "/favicon.ico":
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
             return
-
-        if path in ("/state", "/api/state"):
+        if path == "/health":
+            configured = sum(1 for config in BOOKMAKERS.values() if config["feed_url"])
             with STATE_LOCK:
-                data = dict(STATE)
-            # This state contains no feed URLs or submitted share codes.
-            self.send_json(200, data)
+                last_scan = dict(LAST_SCAN) if LAST_SCAN else None
+                last_lookup = dict(LAST_LOOKUP) if LAST_LOOKUP else None
+                last_feed_status = [dict(item) for item in LAST_FEED_STATUS] if LAST_FEED_STATUS is not None else None
+            feed_status = last_feed_status if last_feed_status is not None else [
+                {
+                    "bookmaker": config["name"],
+                    "status": "not tested" if config["feed_url"] else "not configured",
+                    "detail": "URL is configured but no scan has tested it in this process" if config["feed_url"] else "No feed URL configured",
+                    "http_status": None, "content_type": None, "response_bytes": 0,
+                    "fetch_ms": 0, "json_valid": False, "schema_valid": False,
+                    "raw_events": 0, "events_loaded": 0, "events_rejected": 0,
+                    "last_successful_fetch": None, "data_updated_at": None,
+                    "freshness_seconds": None, "stale": None,
+                }
+                for config in BOOKMAKERS.values()
+            ]
+            self.send_json(200, {
+                "status": "online",
+                "service": "SolveEase Booking & Arbitrage Dashboard",
+                "version": "3.3",
+                "configured_feeds": configured,
+                "feed_status": feed_status,
+                "feed_freshness_threshold_seconds": STALE_AFTER_SECONDS,
+                "feed_status_note": "Configured does not mean tested; HTTP success does not prove official source authenticity or accurate live odds.",
+                "ticket_lookup_adapters": {"sportybet": "available", "bet9ja": "not implemented", "betking": "not implemented"},
+                "last_scan": last_scan,
+                "last_lookup": last_lookup,
+                "uptime_seconds": int(time.time() - STARTED_AT),
+            })
             return
+        self.send_json(404, {"ok": False, "error": "Route not found"})
 
-        if path == "/api/data-health":
-            try:
-                self.send_json(200, data_health())
-            except Exception:
-                log.exception("Data-health endpoint failed.")
-                self.send_error_json(500, "Could not read data health.")
+    def do_POST(self):
+        path = urlsplit(self.path).path
+        if path not in ("/api/lookup", "/api/scan"):
+            self.send_json(404, {"ok": False, "error": "Route not found"})
             return
-
-        if path == "/api/history":
-            try:
-                limit = int(query.get("limit", ["30"])[0])
-                self.send_json(200, {"runs": get_history(limit)})
-            except (ValueError, TypeError):
-                self.send_error_json(400, "limit must be an integer.")
-            except Exception:
-                log.exception("History endpoint failed.")
-                self.send_error_json(500, "Could not read scan history.")
+        if "application/json" not in self.headers.get("Content-Type", "").lower():
+            self.send_json(415, {"ok": False, "error": "JSON body required"})
+            return
+        try:
+            body = self.read_body()
+        except ValueError as exc:
+            self.send_json(400, {"ok": False, "error": str(exc)})
+            return
+        if not isinstance(body, dict):
+            self.send_json(400, {"ok": False, "error": "Expected JSON object"})
             return
 
         if path == "/api/scan":
-            with STATE_LOCK:
-                result = dict(STATE.get("last_scan_summary") or {})
-            self.send_json(200, result or {
-                "status": "not_run",
-                "message": "No scan has completed yet.",
+            try:
+                result = run_scan()
+                self.send_json(200, result)
+            except Exception:
+                logging.exception("Scan failed")
+                self.send_json(500, {
+                    "ok": False,
+                    "error": "Scan failed. Check configured feed schemas and service logs.",
+                })
+            return
+
+        code = body.get("code", "")
+        bookmaker = body.get("bookmaker", "auto")
+        if not isinstance(code, str):
+            self.send_json(400, {"ok": False, "error": "Booking code must be text"})
+            return
+        code = code.strip()
+        if not code or len(code) > 120 or re.search(r"[\x00-\x1f\x7f]", code):
+            self.send_json(400, {"ok": False, "error": "Invalid booking code"})
+            return
+
+        # Only SportyBet lookup is implemented. In auto mode, a successful
+        # lookup confirms the source; code format alone never does.
+        if bookmaker in ("auto", "sportybet"):
+            try:
+                result = lookup_sportybet(code)
+            except Exception:
+                logging.exception("Ticket lookup failed")
+                self.send_json(500, {"ok": False, "error": "Unexpected ticket lookup error"})
+                return
+            if result.get("ok"):
+                self.send_json(200, result)
+            else:
+                self.send_json(502, {
+                    "ok": False,
+                    "error": result.get("error", "SportyBet lookup failed"),
+                    "bookmaker_identification": "Not confirmed. Code format alone is insufficient.",
+                })
+            return
+
+        if bookmaker in ("bet9ja", "betking"):
+            self.send_json(501, {
+                "ok": False,
+                "error": (
+                    "A verified lookup adapter is not configured for this bookmaker. "
+                    "The dashboard will not guess its booking-code format."
+                ),
+                "bookmaker_identification": "Not confirmed",
             })
             return
 
-        if path == "/manifest.webmanifest":
-            self.send_bytes(
-                200, json_bytes(MANIFEST),
-                "application/manifest+json; charset=utf-8"
-            )
-            return
-
-        if path == "/sw.js":
-            self.send_bytes(
-                200, SERVICE_WORKER.encode("utf-8"),
-                "application/javascript; charset=utf-8",
-                {"Service-Worker-Allowed": "/"}
-            )
-            return
-
-        if path == "/icon.svg":
-            self.send_bytes(200, ICON_SVG.encode("utf-8"), "image/svg+xml")
-            return
-
-        if path in ("/", "/scanner", "/matches", "/risk-lab",
-                    "/history", "/data-health", "/reports"):
-            body = render_page(path).encode("utf-8")
-            self.send_bytes(200, body, "text/html; charset=utf-8")
-            return
-
-        self.send_bytes(
-            404,
-            render_page("/not-found").encode("utf-8"),
-            "text/html; charset=utf-8"
-        )
-
-    def do_POST(self):
-        if rate_limited(self):
-            self.send_error_json(429, "Too many requests. Please try again shortly.")
-            return
-
-        path = urlparse(self.path).path.rstrip("/") or "/"
-
-        try:
-            payload = self.read_json_body()
-        except ValueError as exc:
-            self.send_error_json(400, str(exc))
-            return
-
-        if path == "/api/scan":
-            result = run_scan(trigger="manual")
-            code = 200 if result.get("status") != "error" else 500
-            self.send_json(code, result)
-            return
-
-        if path == "/api/analyse":
-            try:
-                self.send_json(200, analyse_ticket(payload))
-            except ValueError as exc:
-                self.send_error_json(400, str(exc))
-            except Exception:
-                log.exception("Analysis endpoint failed.")
-                self.send_error_json(500, "Could not analyse the supplied selections.")
-            return
-
-        if path == "/api/lookup":
-            if not isinstance(payload, dict):
-                self.send_error_json(400, "Expected a JSON object.")
-                return
-
-            code = payload.get("code", "")
-            result = lookup_sportybet(code)
-            status = result.get("status", "")
-            http_status = 200 if status in ("parsed", "response_unrecognised") else 400
-            if status in ("lookup_failed",):
-                http_status = 502
-            self.send_json(http_status, result)
-            return
-
-        self.send_error_json(404, "API endpoint not found.")
-
-
-class Server(ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
+        self.send_json(400, {"ok": False, "error": "Unsupported bookmaker"})
 
 
 def main():
-    init_db()
+    if not math.isfinite(TIMEOUT) or TIMEOUT <= 0:
+        raise ValueError("REQUEST_TIMEOUT_SECONDS must be positive")
+    if not math.isfinite(MIN_PROBABILITY) or not 0 <= MIN_PROBABILITY <= 1:
+        raise ValueError("MIN_PROBABILITY must be between 0 and 1")
+    if not math.isfinite(BANKROLL) or BANKROLL < 0:
+        raise ValueError("BANKROLL must be non-negative")
 
-    with STATE_LOCK:
-        STATE["status"] = "online"
-        STATE["started_at"] = utc_now()
-        STATE["configured_market_feed_count"] = len(MARKET_FEED_URLS)
-
-    log.info("%s v%s starting on %s:%s", APP_NAME, VERSION, HOST, PORT)
-    log.info("Configured market feed URLs: %s", len(MARKET_FEED_URLS))
-    log.info("Database path: %s", DATABASE_PATH)
-    log.info(
-        "Database persistent: %s",
-        DATABASE_PATH != ":memory:" and not DATABASE_PATH.startswith("/tmp/")
-    )
-
-    scheduler = threading.Thread(
-        target=scheduler_loop, name="solveease-scheduler", daemon=True
-    )
-    scheduler.start()
-
-    server = Server((HOST, PORT), Handler)
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    server.daemon_threads = True
+    logging.info("SolveEase dashboard v3.4 listening on port %s", PORT)
     try:
-        server.serve_forever(poll_interval=0.5)
+        server.serve_forever()
     except KeyboardInterrupt:
-        log.info("Shutdown requested.")
+        pass
     finally:
         server.server_close()
 
