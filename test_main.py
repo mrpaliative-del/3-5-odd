@@ -222,6 +222,29 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(rows[0]["hg"], 2)
         self.assertEqual(rows[0]["league"], "England Premier League")
 
+    def test_auto_stats_matches_cross_league_teams_independently(self):
+        from unittest.mock import patch
+        csv_home = "Date,HomeTeam,AwayTeam,FTHG,FTAG\n01/10/26,Alpha FC,Home Opponent,2,0\n08/10/26,Home Opponent,Alpha FC,1,1\n15/10/26,Alpha FC,Home Opponent 2,3,1\n"
+        csv_away = "Date,HomeTeam,AwayTeam,FTHG,FTAG\n02/10/26,Away Opponent,Beta FC,1,1\n09/10/26,Beta FC,Away Opponent 2,2,0\n16/10/26,Away Opponent 3,Beta FC,0,2\n"
+        def fake_csv(season, division):
+            if division == "E0":
+                return csv_home
+            if division == "D1":
+                return csv_away
+            return None
+        with patch.object(app, "_fetch_football_csv", side_effect=fake_csv), \
+             patch.object(app, "_xg_rates", return_value=None):
+            app.FOOTBALL_STATS_CACHE.clear()
+            app.FOOTBALL_DIVISION_MATCH_CACHE.clear()
+            app.FOOTBALL_CSV_CACHE.clear()
+            result = app.fetch_match_statistics("Alpha FC vs Beta FC")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["home_league"], "England Premier League")
+        self.assertEqual(result["away_league"], "Germany Bundesliga")
+        self.assertGreaterEqual(result["home_team_matches_in_sample"], 2)
+        self.assertGreaterEqual(result["away_team_matches_in_sample"], 2)
+        self.assertIn("Independent domestic histories", result["method"])
+
     def test_auto_stats_team_summary_reports_venue_form(self):
         history = [
             {"date": "2026-09-01", "venue": "home", "gf": 2, "ga": 1, "opponent": "B"},
