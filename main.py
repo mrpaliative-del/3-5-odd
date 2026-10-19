@@ -2,13 +2,13 @@
 """
 SolveEase Booking & Arbitrage Dashboard
 Python standard library only.
-Version: 3.4.0
+Version: 3.5.0
 
 Render start command:
     python main.py
 
 Features:
-- Responsive dashboard for mobile and desktop
+- Responsive mobile-first app with dedicated routes for Home, lookup, converter, scanner and feed status
 - Read-only SportyBet booking-code lookup
 - Automatic source identification only after successful supported lookup
 - Source-vs-calculated odds diagnostics
@@ -1166,6 +1166,14 @@ button:disabled{opacity:.55;cursor:wait}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}
 .notice{border-left:3px solid var(--warning);padding-left:11px}
 footer{font-size:12px;color:var(--muted);margin-top:24px}
+.nav{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0 22px}
+.nav a,.feature-link{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;color:var(--text);background:var(--panel2);border:1px solid var(--line);border-radius:11px;padding:11px 14px;font-weight:750;min-height:44px}
+.nav a[aria-current="page"]{background:var(--accent);color:#071b15;border-color:var(--accent)}
+.hero{padding:22px;background:linear-gradient(135deg,#162a40,#101827);border:1px solid var(--line);border-radius:18px;margin:14px 0 18px}
+.hero p{max-width:680px}.feature-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+.feature-card{display:flex;flex-direction:column;gap:8px;padding:17px;background:var(--panel);border:1px solid var(--line);border-radius:15px;min-height:180px}
+.feature-card p{margin:0;flex:1}.feature-card h2{font-size:18px}.feature-link{align-self:flex-start;background:var(--accent);color:#071b15}
+.page-section{display:none}.page-section:not(.page-hidden){display:block}.page-hidden{display:none!important}.eyebrow{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);font-weight:800}
 @media(min-width:760px){.two-col{display:grid;grid-template-columns:1fr 1fr;gap:14px}.two-col .panel{margin:0}}
 </style>
 </head>
@@ -1176,8 +1184,31 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
   <h1>Booking & Arbitrage Dashboard</h1>
   <p>Read-only ticket lookup, manual ticket reconstruction, odds comparison and probability filters.</p>
 </header>
+<nav class="nav" aria-label="Main navigation">
+  <a href="/" data-page="home">Home</a>
+  <a href="/lookup" data-page="lookup">Booking lookup</a>
+  <a href="/converter" data-page="converter">Ticket converter</a>
+  <a href="/scanner" data-page="scanner">Arbitrage scanner</a>
+  <a href="/status" data-page="status">Feed status</a>
+</nav>
 
-<section class="panel" id="lookupPanel">
+<section id="homePage" class="page-section">
+  <div class="hero">
+    <div class="eyebrow">SolveEase · Control centre</div>
+    <h1>Choose a tool. Get a dedicated workspace.</h1>
+    <p>Each tool opens on its own page, with a direct URL and consistent navigation. This dashboard is read-only: it does not place bets or invent booking codes.</p>
+    <div class="actions"><a class="feature-link" href="/scanner">Open arbitrage scanner</a><a class="feature-link" href="/lookup">Look up a ticket</a></div>
+  </div>
+  <div class="feature-grid">
+    <article class="feature-card"><div class="eyebrow">01 · Tickets</div><h2>Booking-code lookup</h2><p>Retrieve supported ticket details and review selection counts and odds diagnostics.</p><a class="feature-link" href="/lookup">Open lookup →</a></article>
+    <article class="feature-card"><div class="eyebrow">02 · Tickets</div><h2>Ticket converter</h2><p>Prepare a structured checklist to recreate a retrieved ticket manually at another bookmaker.</p><a class="feature-link" href="/converter">Open converter →</a></article>
+    <article class="feature-card"><div class="eyebrow">03 · Markets</div><h2>Arbitrage scanner</h2><p>Compare matching two-outcome markets, show qualifying margins, and inspect feed-based probability candidates.</p><a class="feature-link" href="/scanner">Open scanner →</a></article>
+    <article class="feature-card"><div class="eyebrow">04 · Monitoring</div><h2>Feed and service status</h2><p>Inspect configured feeds, response health, freshness and the last scan report.</p><a class="feature-link" href="/status">Open status →</a></article>
+  </div>
+  <section class="panel"><h2>System snapshot</h2><div id="homeHealth">Checking service…</div><p class="small">A service being online does not mean every feed is configured, usable or current.</p></section>
+</section>
+
+<section class="panel page-section" id="lookupPanel">
   <h2>1. Booking-code lookup</h2>
   <p>Enter a code and the dashboard will verify it using the lookup adapters currently available.</p>
   <label for="code">Booking code</label>
@@ -1191,7 +1222,7 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
   <div id="ticketResult"></div>
 </section>
 
-<section class="panel" id="converterPanel">
+<section class="panel page-section" id="converterPanel">
   <h2>2. Bookmaker ticket converter</h2>
   <p>Prepare a copyable checklist from a successfully retrieved ticket for manual recreation at another bookmaker.</p>
   <label for="destinationBookmaker">Destination bookmaker</label>
@@ -1210,7 +1241,7 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
   <p class="small notice">Manual reconstruction only. This does not generate a destination booking code or prove that equivalent markets are available. Verify each event, market, selection, line and current price yourself.</p>
 </section>
 
-<section class="panel" id="scannerPanel">
+<section class="panel page-section" id="scannerPanel">
   <h2>3. Arbitrage scanner</h2>
   <p>Scans only the permitted JSON odds feeds configured on the server. Missing feeds are reported as unavailable, not as proof that no opportunity exists.</p>
   <div class="actions">
@@ -1229,9 +1260,10 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
   <div id="alternatives"></div>
 </section>
 
-<section class="panel">
-  <h2>Service status</h2>
+<section class="panel page-section" id="statusPanel">
+  <div class="eyebrow">Monitoring</div><h2>Feed and service status</h2>
   <div id="health">Checking service…</div>
+  <h3>Configured bookmaker feeds</h3><div id="statusFeedHealth"></div>
   <p class="small">Read-only tools. No automatic bet placement and no bookmaker login credentials requested. Odds and availability can change rapidly.</p>
 </section>
 <footer>SolveEase · Mobile-friendly · Manual confirmation required · No automatic bet placement</footer>
@@ -1241,6 +1273,30 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
 const $ = id => document.getElementById(id);
 let lastLookupData = null;
 let preparedTicketText = "";
+
+function activatePage() {
+  const raw = location.pathname.replace(/\/$/, "") || "/";
+  const page = ({"/":"home","/lookup":"lookup","/converter":"converter","/scanner":"scanner","/status":"status"})[raw];
+  if (!page) { location.replace("/"); return; }
+  const map = {home:"homePage",lookup:"lookupPanel",converter:"converterPanel",scanner:"scannerPanel",status:"statusPanel"};
+  Object.entries(map).forEach(([key,id]) => $(id).classList.toggle("page-hidden", key !== page));
+  document.querySelectorAll(".nav a").forEach(a => {
+    if (a.dataset.page === page) a.setAttribute("aria-current","page");
+    else a.removeAttribute("aria-current");
+  });
+  const titles = {home:"Home",lookup:"Booking-code lookup",converter:"Ticket converter",scanner:"Arbitrage scanner",status:"Feed and service status"};
+  document.title = "SolveEase | " + titles[page];
+  if (page === "home" || page === "status") loadHealth();
+  if (page === "converter") restoreLookup();
+}
+function restoreLookup() {
+  try { lastLookupData = JSON.parse(sessionStorage.getItem("solveease:lastLookup") || "null"); }
+  catch (_) { lastLookupData = null; }
+  if (lastLookupData && lastLookupData.ok === true) {
+    $("converterMessage").textContent = "Previous successful lookup restored for this browser tab.";
+    $("converterMessage").className = "success";
+  }
+}
 
 function el(tag, text, parent, cls) {
   const node = document.createElement(tag);
@@ -1270,6 +1326,7 @@ async function api(path, method="GET", body=null) {
 
 function clearLookup() {
   lastLookupData = null;
+  try { sessionStorage.removeItem("solveease:lastLookup"); } catch (_) {}
   preparedTicketText = "";
   $("code").value = "";
   $("lookupMessage").textContent = "";
@@ -1301,6 +1358,7 @@ async function lookup() {
   try {
     const data = await api("/api/lookup", "POST", {code, bookmaker:"auto"});
     lastLookupData = data;
+    try { sessionStorage.setItem("solveease:lastLookup", JSON.stringify(data)); } catch (_) {}
     $("lookupMessage").textContent = "Lookup completed and source confirmed.";
     $("lookupMessage").className = "success";
     const box = $("ticketResult");
@@ -1452,8 +1510,8 @@ function renderList(targetId, items, renderer, emptyText) {
   items.forEach(item => renderer(item, $(targetId)));
 }
 
-function renderHealth(items) {
-  renderList("sourceHealth", items, (item,parent) => {
+function renderHealth(items, targetId="sourceHealth") {
+  renderList(targetId, items, (item,parent) => {
     const card = el("div", "", parent, "item");
     el("strong", item.bookmaker + " — " + item.status, card);
     el("p", item.detail || "No diagnostic detail available.", card, "small");
@@ -1538,10 +1596,11 @@ async function scan() {
 async function loadHealth() {
   try {
     const data = await api("/health");
-    $("health").textContent =
-      "Service online · " + data.configured_feeds +
+    const summary = "Service online · " + data.configured_feeds +
       " configured odds feeds · SportyBet lookup adapter available";
-    if (data.feed_status) renderHealth(data.feed_status);
+    if ($("health")) $("health").textContent = summary;
+    if ($("homeHealth")) $("homeHealth").textContent = summary;
+    if (data.feed_status && $("sourceHealth")) renderHealth(data.feed_status, $("statusFeedHealth") && !$("statusPanel").classList.contains("page-hidden") ? "statusFeedHealth" : "sourceHealth");
   } catch (_) {
     $("health").textContent = "Could not check service status.";
   }
@@ -1550,7 +1609,7 @@ async function loadHealth() {
 $("code").addEventListener("keydown", event => {
   if (event.key === "Enter") lookup();
 });
-loadHealth();
+activatePage();
 </script>
 </body>
 </html>"""
@@ -1603,14 +1662,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         path = urlsplit(self.path).path
-        if path == "/":
+        if path.rstrip("/") in ("", "/lookup", "/converter", "/scanner", "/status"):
             self.send_bytes(200, HTML.encode("utf-8"), "text/html; charset=utf-8")
         else:
             self.send_json(200, {"status": "online"})
 
     def do_GET(self):
         path = urlsplit(self.path).path.rstrip("/") or "/"
-        if path == "/":
+        if path in ("/", "/lookup", "/converter", "/scanner", "/status"):
             self.send_bytes(200, HTML.encode("utf-8"), "text/html; charset=utf-8")
             return
         if path == "/favicon.ico":
@@ -1640,7 +1699,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "status": "online",
                 "service": "SolveEase Booking & Arbitrage Dashboard",
-                "version": "3.3",
+                "version": "3.5",
                 "configured_feeds": configured,
                 "feed_status": feed_status,
                 "feed_freshness_threshold_seconds": STALE_AFTER_SECONDS,
@@ -1735,7 +1794,7 @@ def main():
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
-    logging.info("SolveEase dashboard v3.4 listening on port %s", PORT)
+    logging.info("SolveEase Booking & Arbitrage Dashboard v3.5.0 listening on port %s", PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
