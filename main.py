@@ -2,7 +2,7 @@
 """
 SolveEase Booking & Arbitrage Dashboard
 Python standard library only.
-Version: 3.5.3
+Version: 3.6.0
 
 Render start command:
     python main.py
@@ -91,7 +91,7 @@ BOOKMAKERS = {
     },
     "1xbet": {
         "name": "1xBet",
-        "feed_url": os.environ.get("ONEXBET_ODDS_FEED_URL", "").strip(),
+        "feed_url": (os.environ.get("ONEXBET_ODDS_FEED_URL") or os.environ.get("X1BET_ODDS_FEED_URL", "")).strip(),
     },
     "betway": {
         "name": "Betway",
@@ -136,6 +136,144 @@ def finite_number(value, minimum=None, maximum=None):
     except (TypeError, ValueError, OverflowError):
         return None
 
+
+
+def poisson_distribution(rate, max_goals=12):
+    """Return a normalized finite Poisson distribution for a validated goal rate."""
+    rate = finite_number(rate, minimum=0.05, maximum=8.0)
+    if rate is None:
+        raise ValueError("Goal rates must be finite numbers from 0.05 to 8.0")
+    probabilities = []
+    for goals in range(max_goals + 1):
+        probabilities.append(math.exp(-rate) * (rate ** goals) / math.factorial(goals))
+    total = sum(probabilities)
+    if total <= 0 or not math.isfinite(total):
+        raise ValueError("Could not calculate a stable goal distribution")
+    # Normalize the truncated distribution so reported market probabilities sum to 1.
+    return [value / total for value in probabilities]
+
+
+def _selection_probability(market, selection, home_rate, away_rate):
+    """Estimate common football market probabilities from two expected-goal rates.
+
+    Supported: 1X2, double chance, totals over/under with a numeric line, and BTTS.
+    This is a simple independent-Poisson model, not a trained/calibrated prediction.
+    """
+    market_text = normalize_text(market)
+    selection_text = normalize_text(selection)
+    home = poisson_distribution(home_rate)
+    away = poisson_distribution(away_rate)
+    scores = [(h, a, hp * ap) for h, hp in enumerate(home) for a, ap in enumerate(away)]
+    if any(term in market_text for term in ("both teams to score", "btts", "both teams score")):
+        yes = sum(prob for h, a, prob in scores if h > 0 and a > 0)
+        if selection_text in ("yes", "btts yes", "both teams to score yes"):
+            return yes, "Independent-Poisson estimate for both teams to score: yes"
+        if selection_text in ("no", "btts no", "both teams to score no"):
+            return 1.0 - yes, "Independent-Poisson estimate for both teams to score: no"
+        return None, "Unsupported BTTS selection label"
+
+    if any(term in market_text for term in ("double chance", "1x2", "match result", "full time result", "result")):
+        home_win = sum(prob for h, a, prob in scores if h > a)
+        draw = sum(prob for h, a, prob in scores if h == a)
+        away_win = sum(prob for h, a, prob in scores if h < a)
+        if selection_text in ("home", "home win", "1", "1x", "home or draw"):
+            if selection_text in ("1x", "home or draw") or "double chance" in market_text and selection_text in ("home/draw", "1x"):
+                return home_win + draw, "Independent-Poisson estimate for home-or-draw"
+            return home_win, "Independent-Poisson estimate for home win"
+        if selection_text in ("draw", "x"):
+            return draw, "Independent-Poisson estimate for draw"
+        if selection_text in ("away", "away win", "2", "x2", "draw or away"):
+            if selection_text in ("x2", "draw or away"):
+                return draw + away_win, "Independent-Poisson estimate for draw-or-away"
+            return away_win, "Independent-Poisson estimate for away win"
+        if selection_text in ("12", "home or away", "no draw"):
+            return home_win + away_win, "Independent-Poisson estimate for no draw"
+        if selection_text in ("1x", "home/draw", "home or draw"):
+            return home_win + draw, "Independent-Poisson estimate for home-or-draw"
+        if selection_text in ("x2", "draw/away", "draw or away"):
+            return draw + away_win, "Independent-Poisson estimate for draw-or-away"
+        return None, "Unsupported result selection label; use Home, Draw, Away, 1X, 12, or X2"
+
+    # Market text needs an explicit numeric goal line to avoid guessing the line.
+    match = re.search(r"(?:over|under|total(?: goals)?|goals?)\s*(\d+(?:\.\d+)?)|(?:total=)(\d+(?:\.\d+)?)", market_text)
+    line = None
+    if match:
+        line = float(match.group(1) or match.group(2))
+    if line is not None and ("over" in market_text or "under" in market_text or "total" in market_text or "goal" in market_text):
+        over = sum(prob for h, a, prob in scores if h + a > line)
+        under = sum(prob for h, a, prob in scores if h + a < line)
+        # Whole-number lines can push exact totals into a refund/push bucket.
+        if selection_text.startswith("over"):
+            return over, f"Independent-Poisson estimate for total goals over {line:g}"
+        if selection_text.startswith("under"):
+            return under, f"Independent-Poisson estimate for total goals under {line:g}"
+        return None, "Unsupported total-goals selection label; use Over <line> or Under <line>"
+    return None, "Unsupported market; supported markets are 1X2/double chance, totals with a line, and BTTS"
+
+
+def analyze_betslip(payload):
+    """Analyze user-selected betslip legs; no external calls or automatic betting."""
+    legs = payload.get("legs") if isinstance(payload, dict) else None
+    if not isinstance(legs, list) or not legs:
+        raise ValueError("Provide a non-empty 'legs' array")
+    if len(legs) > 50:
+        raise ValueError("Maximum 50 selected legs per analysis")
+    analyzed = []
+    for index, leg in enumerate(legs, start=1):
+        if not isinstance(leg, dict):
+            raise ValueError(f"Leg {index} must be an object")
+        event = str(leg.get("event", "")).strip()
+        market = str(leg.get("market", "")).strip()
+        selection = str(leg.get("selection", "")).strip()
+        odds = finite_number(leg.get("odds"), minimum=1.01, maximum=1000)
+        home_rate = finite_number(leg.get("home_goal_rate"), minimum=0.05, maximum=8.0)
+        away_rate = finite_number(leg.get("away_goal_rate"), minimum=0.05, maximum=8.0)
+        if not event or len(event) > 180 or not market or len(market) > 100 or not selection or len(selection) > 100:
+            raise ValueError(f"Leg {index}: event, market and selection are required and must be short text")
+        if odds is None:
+            raise ValueError(f"Leg {index}: odds must be a finite decimal value from 1.01 to 1000")
+        if home_rate is None or away_rate is None:
+            raise ValueError(f"Leg {index}: home_goal_rate and away_goal_rate must each be from 0.05 to 8.0")
+        probability, method = _selection_probability(market, selection, home_rate, away_rate)
+        implied = 1.0 / odds
+        estimated_edge = (probability * odds - 1.0) * 100.0 if probability is not None else None
+        analyzed.append({
+            "event": event, "market": market, "selection": selection, "odds": odds,
+            "home_goal_rate": home_rate, "away_goal_rate": away_rate,
+            "estimated_probability": probability,
+            "model_fair_odds": (1.0 / probability) if probability and probability > 0 else None,
+            "odds_implied_probability": implied,
+            "estimated_edge_percent": estimated_edge,
+            "model_supported": probability is not None,
+            "method": method,
+            "status": (
+                "model suggests positive edge; verify rates, odds and settlement"
+                if probability is not None and estimated_edge is not None and estimated_edge > 0
+                else "no positive model edge at entered odds; not a betting recommendation"
+                if probability is not None
+                else "not ranked: unsupported market/selection"
+            ),
+        })
+    supported = [item for item in analyzed if item["model_supported"]]
+    supported.sort(key=lambda item: (item["estimated_edge_percent"], item["estimated_probability"]), reverse=True)
+    unsupported = [item for item in analyzed if not item["model_supported"]]
+    # No combined probability is offered because legs may be correlated and the model is not calibrated.
+    return {
+        "ok": True,
+        "analyzed_at": now_iso(),
+        "model": "independent Poisson goal model; rates supplied by user",
+        "legs_received": len(analyzed),
+        "supported_legs": len(supported),
+        "unsupported_legs": len(unsupported),
+        "ranked_legs": supported + unsupported,
+        "warnings": [
+            "Goal rates are user-supplied expected-goal inputs, not automatically fetched team statistics.",
+            "The independent-Poisson model is a baseline estimate, not a calibrated or verified prediction.",
+            "Estimated edge is only meaningful if the goal rates are credible and odds are current.",
+            "No combined accumulator win probability is calculated because legs may be correlated.",
+            "This tool is read-only and never places bets.",
+        ],
+    }
 
 def scalar(value):
     if isinstance(value, (str, int, bool)):
@@ -1276,6 +1414,21 @@ footer{font-size:12px;color:var(--muted);margin-top:24px}
   <div id="scanMessage" role="status" aria-live="polite"></div>
   <div id="sourceHealth"></div>
   <div id="scanSummary" class="grid"></div>
+  <section class="panel" aria-labelledby="betslipAnalysisTitle">
+    <h3 id="betslipAnalysisTitle">Selected betslip market analysis</h3>
+    <p class="small">Paste your selected legs as JSON. Enter expected-goal rates from a credible source; this tool does not fetch team statistics automatically. Supported markets: 1X2, double chance, totals with a line, and both-teams-to-score.</p>
+    <label for="betslipJson">Selected games and markets (JSON)</label>
+    <textarea id="betslipJson" rows="10" maxlength="16000" spellcheck="false">{
+  "legs": [
+    {"event":"Alpha FC vs Beta FC","market":"1X2","selection":"Home","odds":2.10,"home_goal_rate":1.55,"away_goal_rate":1.05},
+    {"event":"Alpha FC vs Beta FC","market":"Total Goals 2.5","selection":"Over 2.5","odds":1.90,"home_goal_rate":1.55,"away_goal_rate":1.05}
+  ]
+}</textarea>
+    <div class="actions"><button type="button" id="analyzeBetslipBtn" onclick="analyzeBetslip()">Analyze selected markets</button><button type="button" class="secondary" onclick="clearBetslipAnalysis()">Clear analysis</button></div>
+    <div id="betslipAnalysisMessage" role="status" aria-live="polite"></div>
+    <div id="betslipAnalysisReport"></div>
+    <p class="small notice">Model estimates are not verified forecasts. Do not interpret a positive estimated edge as proof of value or profit. Confirm market settlement rules and current odds independently.</p>
+  </section>
   <section class="panel" aria-labelledby="accumulatorTitle">
     <h3 id="accumulatorTitle">Accumulator calculator & report</h3>
     <p class="small">Enter one selection per line as <code>Selection label | decimal odds</code>. This calculates the ticket maths only; it does not estimate whether the selections will win.</p>
@@ -1692,6 +1845,46 @@ async function scan() {
   }
 }
 
+async function analyzeBetslip() {
+  const message = $("betslipAnalysisMessage");
+  const report = $("betslipAnalysisReport");
+  clear("betslipAnalysisReport");
+  message.className = "";
+  let payload;
+  try { payload = JSON.parse($("betslipJson").value); }
+  catch (_) { message.textContent = "The betslip must be valid JSON."; message.className = "error"; return; }
+  const button = $("analyzeBetslipBtn"); button.disabled = true;
+  message.textContent = "Calculating supported market probabilities…";
+  try {
+    const data = await api("/api/analyze-betslip", "POST", payload);
+    const grid = el("div", "", report, "grid");
+    [["Legs received",data.legs_received],["Supported by model",data.supported_legs],["Unsupported legs",data.unsupported_legs]].forEach(([label,value]) => {
+      const card = el("div", "", grid, "stat"); el("span", label, card); el("strong", String(value), card);
+    });
+    data.ranked_legs.forEach((leg, index) => {
+      const card = el("div", "", report, "item");
+      el("h3", (index + 1) + ". " + leg.event, card);
+      el("p", leg.market + " · " + leg.selection + " · odds " + money(leg.odds, 3), card);
+      if (leg.model_supported) {
+        el("p", "Model probability: " + money(leg.estimated_probability * 100) + "% · model fair odds: " + money(leg.model_fair_odds, 3), card);
+        el("p", "Odds-implied probability (raw): " + money(leg.odds_implied_probability * 100) + "% · estimated edge: " + money(leg.estimated_edge_percent) + "%", card, leg.estimated_edge_percent > 0 ? "success" : "small");
+      } else el("p", "No probability estimate produced.", card, "warning");
+      el("p", leg.method, card, "small");
+      el("p", "Expected goals entered: home " + leg.home_goal_rate + " / away " + leg.away_goal_rate, card, "small");
+    });
+    data.warnings.forEach(warning => el("p", warning, report, "small notice"));
+    message.textContent = "Analysis complete. Supported markets are ranked by estimated edge, then probability; no bet was placed.";
+    message.className = "success";
+  } catch (err) { message.textContent = err.message; message.className = "error"; }
+  finally { button.disabled = false; }
+}
+function clearBetslipAnalysis() {
+  $("betslipJson").value = "";
+  $("betslipAnalysisMessage").textContent = "";
+  $("betslipAnalysisMessage").className = "";
+  clear("betslipAnalysisReport");
+}
+
 async function loadHealth() {
   try {
     const data = await api("/health");
@@ -1720,7 +1913,7 @@ activatePage();
 # ---------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SolveEase/3.5.3"
+    server_version = "SolveEase/3.6.0"
 
     def log_message(self, fmt, *args):
         # Avoid logging query strings, POST bodies, and booking codes.
@@ -1799,7 +1992,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "status": "online",
                 "service": "SolveEase Booking & Arbitrage Dashboard",
-                "version": "3.5.3",
+                "version": "3.6.0",
                 "configured_feeds": configured,
                 "feed_status": feed_status,
                 "feed_freshness_threshold_seconds": STALE_AFTER_SECONDS,
@@ -1814,7 +2007,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlsplit(self.path).path
-        if path not in ("/api/lookup", "/api/scan"):
+        if path not in ("/api/lookup", "/api/scan", "/api/analyze-betslip"):
             self.send_json(404, {"ok": False, "error": "Route not found"})
             return
         if "application/json" not in self.headers.get("Content-Type", "").lower():
@@ -1827,6 +2020,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not isinstance(body, dict):
             self.send_json(400, {"ok": False, "error": "Expected JSON object"})
+            return
+
+        if path == "/api/analyze-betslip":
+            try:
+                result = analyze_betslip(body)
+                self.send_json(200, result)
+            except ValueError as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+            except Exception:
+                logging.exception("Betslip analysis failed")
+                self.send_json(500, {"ok": False, "error": "Betslip analysis failed safely; check server logs."})
             return
 
         if path == "/api/scan":
@@ -1894,7 +2098,7 @@ def main():
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
-    logging.info("SolveEase Booking & Arbitrage Dashboard v3.5.3 listening on port %s", PORT)
+    logging.info("SolveEase Booking & Arbitrage Dashboard v3.6.0 listening on port %s", PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1904,4 +2108,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if os.environ.get("SCAN_ONCE", "").strip().lower() in ("1", "true", "yes"):
+        try:
+            print(json.dumps(run_scan(), ensure_ascii=False, indent=2, allow_nan=False))
+        except Exception:
+            logging.exception("One-shot scan failed")
+            raise SystemExit(1)
+    else:
+        main()

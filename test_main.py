@@ -1,7 +1,10 @@
+"""Unit tests for SolveEase. Uses synthetic fixtures; no live bookmaker requests."""
 import importlib.util
+import json
+import math
 import unittest
-from unittest.mock import patch
 from pathlib import Path
+from unittest.mock import patch
 
 MODULE_PATH = Path(__file__).with_name("main.py")
 spec = importlib.util.spec_from_file_location("solveease_main", MODULE_PATH)
@@ -41,23 +44,21 @@ class ScannerTests(unittest.TestCase):
         self.assertIsNone(app.finite_number(float("nan")))
         self.assertIsNone(app.finite_number(float("inf")))
 
-    def test_all_dashboard_pages_exist(self):
+    def test_all_dashboard_pages_exist_and_betslip_ui_is_present(self):
         for page_id in ("homePage", "lookupPanel", "converterPanel", "scannerPanel", "statusPanel"):
             self.assertIn(f'id="{page_id}"', app.HTML)
         self.assertIn("analyzeAccumulator", app.HTML)
+        self.assertIn("analyzeBetslip", app.HTML)
+        self.assertIn("/api/analyze-betslip", app.HTML)
 
     def test_sportybet_documented_nested_schema_fixture(self):
-        payload = {
-            "bizCode": 10000,
-            "data": {"tournaments": [{"name": "Example League", "events": [{
-                "homeTeamName": "Alpha FC", "awayTeamName": "Beta FC",
-                "estimateStartTime": 1790000000000,
-                "markets": [{"desc": "Total Goals", "specifier": "total=2.5", "outcomes": [
-                    {"desc": "Over 2.5", "odds": "2.10", "isActive": True},
-                    {"desc": "Under 2.5", "odds": "1.90", "isActive": True},
-                ]}]
-            }]}]}
-        }
+        payload = {"bizCode": 10000, "data": {"tournaments": [{"name": "Example League", "events": [{
+            "homeTeamName": "Alpha FC", "awayTeamName": "Beta FC", "estimateStartTime": 1790000000000,
+            "markets": [{"desc": "Total Goals", "specifier": "total=2.5", "outcomes": [
+                {"desc": "Over 2.5", "odds": "2.10", "isActive": True},
+                {"desc": "Under 2.5", "odds": "1.90", "isActive": True},
+            ]}]
+        }]}]}}
         rows, raw_count, detail = app.adapt_sportybet_payload(payload)
         self.assertEqual(raw_count, 1)
         self.assertIn("schema recognized", detail)
@@ -70,58 +71,8 @@ class ScannerTests(unittest.TestCase):
         payload = {
             "events": [{"id": 10, "home": "Alpha FC", "away": "Beta FC"}],
             "markets": [{"id": 20, "eventId": 10, "name": "Total Goals 2.5"}],
-            "outcomes": [
-                {"id": 30, "marketId": 20, "name": "Over 2.5", "odds": 2.1},
-                {"id": 31, "marketId": 20, "name": "Under 2.5", "odds": 1.9},
-            ],
-            "prices": [],
-        }
-        rows, raw_count, detail = app.adapt_betway_payload(payload)
-        self.assertEqual(raw_count, 1)
-        self.assertIn("recognized", detail)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["event"], "Alpha FC vs Beta FC")
-
-    def test_betway_nigeria_url_is_not_redirected_to_south_africa(self):
-        url = "https://www.betway.com.ng/"
-        prepared, _ = app.prepare_feed_request("betway", url)
-        self.assertEqual(prepared, url)
-
-    def test_1xbet_compact_fixture_does_not_invent_odds(self):
-        payload = {"Value": [{"LI": 123, "L": "Alpha FC - Beta FC", "O1": "Alpha FC", "O2": "Beta FC"}]}
-        rows, count, detail = app.adapt_1xbet_payload(payload)
-        self.assertEqual(count, 1)
-        self.assertEqual(rows, [])
-        self.assertIn("no supported explicit", detail)
-
-    def test_sportybet_documented_nested_schema_fixture(self):
-        payload = {
-            "bizCode": 10000,
-            "data": {"tournaments": [{"name": "Example League", "events": [{
-                "homeTeamName": "Alpha FC", "awayTeamName": "Beta FC",
-                "estimateStartTime": 1790000000000,
-                "markets": [{"desc": "Total Goals", "specifier": "total=2.5", "outcomes": [
-                    {"desc": "Over 2.5", "odds": "2.10", "isActive": True},
-                    {"desc": "Under 2.5", "odds": "1.90", "isActive": True},
-                ]}]
-            }]}]}
-        }
-        rows, raw_count, detail = app.adapt_sportybet_payload(payload)
-        self.assertEqual(raw_count, 1)
-        self.assertIn("schema recognized", detail)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["event"], "Alpha FC vs Beta FC")
-        self.assertEqual(rows[0]["outcomes"][0]["odds"], 2.1)
-        self.assertIsNone(rows[0]["updated_at"])
-
-    def test_betway_flat_array_schema_fixture(self):
-        payload = {
-            "events": [{"id": 10, "home": "Alpha FC", "away": "Beta FC"}],
-            "markets": [{"id": 20, "eventId": 10, "name": "Total Goals 2.5"}],
-            "outcomes": [
-                {"id": 30, "marketId": 20, "name": "Over 2.5", "odds": 2.1},
-                {"id": 31, "marketId": 20, "name": "Under 2.5", "odds": 1.9},
-            ],
+            "outcomes": [{"id": 30, "marketId": 20, "name": "Over 2.5", "odds": 2.1},
+                         {"id": 31, "marketId": 20, "name": "Under 2.5", "odds": 1.9}],
             "prices": [],
         }
         rows, raw_count, detail = app.adapt_betway_payload(payload)
@@ -156,6 +107,52 @@ class ScannerTests(unittest.TestCase):
         finally:
             app.BOOKMAKERS.clear()
             app.BOOKMAKERS.update(original)
+
+    def test_poisson_distribution_is_normalized(self):
+        distribution = app.poisson_distribution(1.6)
+        self.assertAlmostEqual(sum(distribution), 1.0, places=12)
+        self.assertTrue(all(value >= 0 for value in distribution))
+
+    def test_betslip_analysis_ranks_supported_market_and_returns_probability(self):
+        result = app.analyze_betslip({"legs": [{
+            "event": "Alpha FC vs Beta FC", "market": "Total Goals 2.5", "selection": "Over 2.5",
+            "odds": 2.1, "home_goal_rate": 1.6, "away_goal_rate": 1.1,
+        }]})
+        leg = result["ranked_legs"][0]
+        self.assertTrue(leg["model_supported"])
+        self.assertGreater(leg["estimated_probability"], 0)
+        self.assertLess(leg["estimated_probability"], 1)
+        self.assertAlmostEqual(leg["odds_implied_probability"], 1 / 2.1)
+        self.assertIn("edge", leg["status"])
+        self.assertIn("supplied by user", result["model"])
+
+    def test_betslip_analysis_supports_1x2_and_btts(self):
+        result = app.analyze_betslip({"legs": [
+            {"event": "A vs B", "market": "1X2", "selection": "Home", "odds": 2.2, "home_goal_rate": 1.7, "away_goal_rate": 0.9},
+            {"event": "A vs B", "market": "BTTS", "selection": "Yes", "odds": 1.8, "home_goal_rate": 1.7, "away_goal_rate": 0.9},
+        ]})
+        self.assertEqual(result["supported_legs"], 2)
+        self.assertTrue(all(0 < leg["estimated_probability"] < 1 for leg in result["ranked_legs"]))
+
+    def test_betslip_rejects_invalid_odds_and_goal_rates(self):
+        with self.assertRaises(ValueError):
+            app.analyze_betslip({"legs": [{"event": "A vs B", "market": "1X2", "selection": "Home", "odds": 1.0, "home_goal_rate": 1.2, "away_goal_rate": 1.0}]})
+        with self.assertRaises(ValueError):
+            app.analyze_betslip({"legs": [{"event": "A vs B", "market": "1X2", "selection": "Home", "odds": 2.0, "home_goal_rate": 9, "away_goal_rate": 1.0}]})
+
+    def test_unsupported_market_is_not_given_a_fabricated_probability(self):
+        result = app.analyze_betslip({"legs": [{
+            "event": "A vs B", "market": "First throw-in", "selection": "Home", "odds": 2.0,
+            "home_goal_rate": 1.2, "away_goal_rate": 1.0,
+        }]})
+        self.assertFalse(result["ranked_legs"][0]["model_supported"])
+        self.assertIsNone(result["ranked_legs"][0]["estimated_probability"])
+
+    def test_empty_or_oversized_betslip_rejected(self):
+        with self.assertRaises(ValueError):
+            app.analyze_betslip({"legs": []})
+        with self.assertRaises(ValueError):
+            app.analyze_betslip({"legs": [{}] * 51})
 
 
 if __name__ == "__main__":
